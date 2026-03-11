@@ -1,4 +1,4 @@
-# HIPPS-DIMES GUI
+# HIPPS-DIMES APP
 
 A standalone Streamlit app for running HIPPS-DIMES and inspecting the results locally.
 
