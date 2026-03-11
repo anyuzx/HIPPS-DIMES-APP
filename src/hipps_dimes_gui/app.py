@@ -889,21 +889,30 @@ def _plot_matrix(
     colorscale: str,
     midpoint: float | None = None,
     log_transform: bool = False,
+    corner_labels: tuple[tuple[str, str], ...] = (),
 ) -> go.Figure:
     plot_matrix = np.asarray(matrix)
     colorbar_title = "value"
     if log_transform:
         plot_matrix = np.where(plot_matrix > 0, np.log(plot_matrix), np.nan)
         colorbar_title = "log(value)"
+    n_rows, n_cols = plot_matrix.shape
+    row_index, col_index = np.indices((n_rows, n_cols))
+    customdata = np.dstack((row_index, col_index))
+    x_coords = np.arange(n_cols, dtype=float) + 0.5
+    y_coords = np.arange(n_rows, dtype=float) + 0.5
 
     figure = go.Figure(
         data=[
             go.Heatmap(
+                x=x_coords,
+                y=y_coords,
                 z=plot_matrix,
+                customdata=customdata,
                 colorscale=colorscale,
                 zmid=midpoint,
                 colorbar=dict(title=colorbar_title),
-                hovertemplate="row=%{y}<br>col=%{x}<br>value=%{z:.4g}<extra></extra>",
+                hovertemplate="row=%{customdata[0]}<br>col=%{customdata[1]}<br>value=%{z:.4g}<extra></extra>",
             )
         ]
     )
@@ -913,9 +922,30 @@ def _plot_matrix(
         margin=dict(l=20, r=20, t=60, b=20),
         xaxis_title="Locus",
         yaxis_title="Locus",
+        dragmode="pan",
     )
-    figure.update_yaxes(scaleanchor="x", scaleratio=1)
-    figure.update_yaxes(autorange="reversed")
+    for text, corner in corner_labels:
+        x = 0.03 if "left" in corner else 0.97
+        y = 0.03 if "lower" in corner else 0.97
+        xanchor = "left" if "left" in corner else "right"
+        yanchor = "bottom" if "lower" in corner else "top"
+        figure.add_annotation(
+            x=x,
+            y=y,
+            xref="x domain",
+            yref="y domain",
+            text=text,
+            showarrow=False,
+            xanchor=xanchor,
+            yanchor=yanchor,
+            font=dict(size=13, color="#182026"),
+            bgcolor="rgba(255, 250, 243, 0.88)",
+            bordercolor="rgba(24, 32, 38, 0.18)",
+            borderwidth=1,
+            borderpad=4,
+        )
+    figure.update_xaxes(range=[0, n_cols], constrain="domain")
+    figure.update_yaxes(range=[n_rows, 0], scaleanchor="x", scaleratio=1)
     return figure
 
 
@@ -1018,6 +1048,45 @@ def _plot_two_series(
     return figure
 
 
+def _plot_dual_axis_series(
+    x1: np.ndarray,
+    y1: np.ndarray,
+    label1: str,
+    x2: np.ndarray,
+    y2: np.ndarray,
+    label2: str,
+    log_x: bool = True,
+    log_y1: bool = False,
+    log_y2: bool = True,
+) -> go.Figure:
+    figure = make_subplots(specs=[[{"secondary_y": True}]])
+    figure.add_trace(
+        go.Scatter(
+            x=x1,
+            y=y1,
+            mode="lines",
+            line=dict(color="#d97706", width=2.5),
+            name=label1,
+        ),
+        secondary_y=False,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=x2,
+            y=y2,
+            mode="lines",
+            line=dict(color="#0f766e", width=2.5),
+            name=label2,
+        ),
+        secondary_y=True,
+    )
+    figure.update_layout(height=480, margin=dict(l=20, r=20, t=40, b=20))
+    figure.update_xaxes(type="log" if log_x else "linear")
+    figure.update_yaxes(type="log" if log_y1 else "linear", secondary_y=False)
+    figure.update_yaxes(type="log" if log_y2 else "linear", secondary_y=True)
+    return figure
+
+
 def _render_overview(artifacts: RunArtifacts) -> None:
     results = artifacts.results
     iteration_series = results["iteration_series"]
@@ -1086,26 +1155,36 @@ def _render_matrices(results: dict[str, Any]) -> None:
         distance_title = "Distance map comparison"
 
     options: dict[str, tuple[np.ndarray, str, float | None, bool, str]] = {
-        "Final distance map": (distance_matrix, "Sunset", None, False, distance_title),
+        "Final distance map": (distance_matrix, "Viridis", None, False, distance_title),
         "Connectivity matrix": (results["connectivity_matrix"], "Tealrose", 0.0, False, "Connectivity matrix"),
     }
     if "cmap_final" in results and "cmap_target" in results:
         options["Final contact map"] = (
             _combine_triangle_matrices(results["cmap_target"], results["cmap_final"]),
-            "Viridis",
+            "Oranges",
             None,
             True,
             "Contact map comparison",
         )
     elif "cmap_final" in results:
-        options["Final contact map"] = (results["cmap_final"], "Viridis", None, True, "Final contact map")
+        options["Final contact map"] = (results["cmap_final"], "Oranges", None, True, "Final contact map")
 
     labels = list(options.keys())
     selected = st.selectbox("Matrix", labels, index=0)
     matrix, colorscale, midpoint, log_transform, title = options[selected]
+    corner_labels: tuple[tuple[str, str], ...] = ()
+    if selected in {"Final distance map", "Final contact map"} and (
+        (selected == "Final distance map" and "dmap_target" in results)
+        or (selected == "Final contact map" and "cmap_target" in results)
+    ):
+        corner_labels = (
+            ("Target", "lower left"),
+            ("HIPPS-DIMES", "upper right"),
+        )
     st.plotly_chart(
-        _plot_matrix(matrix, title, colorscale, midpoint, log_transform=log_transform),
+        _plot_matrix(matrix, title, colorscale, midpoint, log_transform=log_transform, corner_labels=corner_labels),
         use_container_width=True,
+        config={"scrollZoom": True},
     )
 
     if selected == "Final distance map" and "dmap_target" in results:
@@ -1125,6 +1204,7 @@ def _render_matrices(results: dict[str, Any]) -> None:
             st.plotly_chart(
                 _plot_matrix(checkpoints[selected_step], f"Connectivity at iteration {selected_step}", "Tealrose", 0.0),
                 use_container_width=True,
+                config={"scrollZoom": True},
             )
 
 
@@ -1184,7 +1264,7 @@ def _render_dynamics(bindings: HippsBindings, results: dict[str, Any]) -> None:
         i = i_col.slider("Locus i", min_value=0, max_value=int(n_loci - 1), value=0)
         j = j_col.slider("Locus j", min_value=0, max_value=int(n_loci - 1), value=min(1, n_loci - 1))
         acf, two_point_msd = bindings.compute_acf_general_theory(i, j, times, connectivity_matrix, zeta=zeta)
-        figure = _plot_two_series(
+        figure = _plot_dual_axis_series(
             acf[:, 0],
             acf[:, 1],
             f"ACF ({i}, {j})",
@@ -1192,10 +1272,23 @@ def _render_dynamics(bindings: HippsBindings, results: dict[str, Any]) -> None:
             two_point_msd[:, 1],
             f"2-point MSD ({i}, {j})",
             log_x=True,
-            log_y=False,
+        )
+        acf_t0 = float(acf[0, 1] + 0.5 * two_point_msd[0, 1])
+        acf_one_over_e = acf_t0 / np.e
+        figure.add_trace(
+            go.Scatter(
+                x=[acf[0, 0], acf[-1, 0]],
+                y=[acf_one_over_e, acf_one_over_e],
+                mode="lines",
+                line=dict(color="#9c6644", width=2, dash="dash"),
+                name="ACF(0) / e",
+                hovertemplate="ACF(0)/e=%{y:.4g}<extra></extra>",
+            ),
+            secondary_y=False,
         )
         figure.update_xaxes(title_text="Time")
-        figure.update_yaxes(title_text="Value")
+        figure.update_yaxes(title_text="ACF", secondary_y=False)
+        figure.update_yaxes(title_text="2-point MSD", secondary_y=True)
         st.plotly_chart(figure, use_container_width=True)
         merged = pd.DataFrame(
             {
