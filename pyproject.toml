@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hipps-dimes-gui"
+version = "0.1.0"
+description = "Local Streamlit GUI for running and visualizing HIPPS-DIMES"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit>=1.44.0",
+    "plotly>=6.0.0",
+    "numpy>=2.0.0",
+    "pandas>=2.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hipps_dimes_gui"]
