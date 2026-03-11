@@ -21,6 +21,7 @@ APP_TITLE = "HIPPS-DIMES Workbench"
 APP_SUBTITLE = "Run local reconstructions, inspect matrices, and explore dynamics and mechanics without leaving Python."
 INPUT_FILE_SUFFIXES = (".txt", ".csv", ".npy", ".cool", ".mcool", ".hic")
 MAX_BROWSER_ENTRIES = 2000
+COOLER_FILE_SUFFIXES = {".cool", ".mcool"}
 SUPPORTED_INPUT_FORMATS = {
     "cmap": ("text", "npy", "cooler", "hic"),
     "dmap": ("text", "npy"),
@@ -179,6 +180,15 @@ def _split_browser_input_path(raw_path: str) -> str:
     return raw_path.split("::", 1)[0].strip()
 
 
+def _split_input_path_group(raw_path: str) -> tuple[str, str | None]:
+    base_path = _split_browser_input_path(raw_path)
+    if "::" not in raw_path:
+        return base_path, None
+    _, group = raw_path.split("::", 1)
+    stripped_group = group.strip()
+    return base_path, stripped_group or None
+
+
 def _seed_browser_directory() -> Path:
     input_path = st.session_state.get("input_path", "").strip()
     if input_path:
@@ -203,6 +213,8 @@ def _initialize_path_state() -> None:
         st.session_state["browser_dir_entry"] = st.session_state["browser_dir"]
     if "browser_notice" not in st.session_state:
         st.session_state["browser_notice"] = None
+    if "browser_cooler_group" not in st.session_state:
+        st.session_state["browser_cooler_group"] = ""
 
 
 def _set_browser_directory(target: Path) -> None:
@@ -266,6 +278,90 @@ def _use_selected_browser_file(selected_file: str) -> None:
     _set_browser_notice("success", f"Selected `{selected_file}`")
 
 
+def _format_cooler_group_option(group: str) -> str:
+    if not group:
+        return "Select a cooler group"
+    if group == "/":
+        return "root (no suffix)"
+    if group.startswith("/resolutions/"):
+        return f"{group.rsplit('/', 1)[-1]} ({group})"
+    return group
+
+
+@st.cache_data(show_spinner=False)
+def _list_cooler_groups(input_path: str) -> tuple[str, ...]:
+    _ensure_hipps_dimes_importable()
+    from hipps_dimes.numerics import cooler as cooler_module
+
+    if cooler_module is None or not hasattr(cooler_module, "fileops"):
+        raise ImportError("cooler support is unavailable in this environment.")
+
+    groups = list(cooler_module.fileops.list_coolers(input_path))
+    if Path(input_path).suffix.lower() == ".cool" and "/" not in groups:
+        groups.insert(0, "/")
+    return tuple(dict.fromkeys(groups))
+
+
+def _apply_selected_cooler_group() -> None:
+    raw_input_path = st.session_state.get("input_path", "").strip()
+    base_path, _ = _split_input_path_group(raw_input_path)
+    if not base_path:
+        _set_browser_notice("info", "Select a cooler file first.")
+        return
+
+    selected_group = st.session_state.get("browser_cooler_group", "").strip()
+    normalized_base = _normalize_input_path(base_path)
+    if not selected_group:
+        st.session_state["input_path"] = normalized_base
+        _set_browser_notice("info", "Cleared the cooler group suffix.")
+        return
+    if selected_group == "/":
+        st.session_state["input_path"] = normalized_base
+        _set_browser_notice("success", "Using the root cooler group.")
+        return
+    st.session_state["input_path"] = f"{normalized_base}::{selected_group}"
+    _set_browser_notice("success", f"Appended cooler group `{selected_group}`")
+
+
+def _render_cooler_group_picker() -> None:
+    raw_input_path = st.session_state.get("input_path", "").strip()
+    base_path, current_group = _split_input_path_group(raw_input_path)
+    if not base_path:
+        return
+
+    suffix = Path(base_path).suffix.lower()
+    if suffix not in COOLER_FILE_SUFFIXES:
+        return
+
+    normalized_base = _normalize_input_path(base_path)
+    if not normalized_base:
+        return
+
+    st.markdown("")
+    st.caption("Cooler groups / resolutions")
+    try:
+        groups = list(_list_cooler_groups(normalized_base))
+    except Exception as exc:
+        st.info(f"Could not inspect cooler groups for `{Path(base_path).name}`: {exc}")
+        return
+
+    if not groups:
+        st.info("No cooler groups were found in this file.")
+        return
+
+    options = [""] + groups
+    desired_group = current_group if current_group in groups else ""
+    st.session_state["browser_cooler_group"] = desired_group
+    st.selectbox(
+        "Available groups",
+        options=options,
+        key="browser_cooler_group",
+        format_func=_format_cooler_group_option,
+        help="Selecting a group appends it to the Input file path automatically.",
+        on_change=_apply_selected_cooler_group,
+    )
+
+
 def _list_browser_entries(directory: Path, show_hidden: bool, show_all_files: bool, name_filter: str) -> tuple[list[str], list[str]]:
     directories: list[str] = []
     files: list[str] = []
@@ -301,7 +397,7 @@ def _render_filesystem_picker() -> None:
         current_dir = _seed_browser_directory()
         _set_browser_directory(current_dir)
 
-    st.caption("Pick a local file to populate the input path. For multires cooler files, append `::group` manually after selection.")
+    st.caption("Pick a local file to populate the input path. For cooler files, you can inspect and append groups below.")
 
     notice = st.session_state.get("browser_notice")
     if notice is not None:
@@ -355,6 +451,8 @@ def _render_filesystem_picker() -> None:
             on_click=_use_selected_browser_file,
             args=[selected_file],
         )
+
+    _render_cooler_group_picker()
 
     if not directories and not files:
         st.info("No entries matched the current filter.")
