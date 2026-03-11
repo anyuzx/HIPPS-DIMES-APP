@@ -21,20 +21,22 @@ APP_TITLE = "HIPPS-DIMES Workbench"
 APP_SUBTITLE = "Run local reconstructions, inspect matrices, and explore dynamics and mechanics without leaving Python."
 INPUT_FILE_SUFFIXES = (".txt", ".csv", ".npy", ".cool", ".mcool", ".hic")
 MAX_BROWSER_ENTRIES = 2000
+SUPPORTED_INPUT_FORMATS = {
+    "cmap": ("text", "npy", "cooler", "hic"),
+    "dmap": ("text", "npy"),
+    "ddmap": ("text", "npy"),
+}
 
 
 @dataclass
 class HippsBindings:
     run_optimization: Callable[..., dict[str, Any]]
-    a2cmap_theory: Callable[..., np.ndarray]
-    a2dmap_theory: Callable[..., np.ndarray]
     cmap2dmap: Callable[..., np.ndarray]
     cmap2dmap_missing_data: Callable[..., np.ndarray]
     compute_m1_i: Callable[..., np.ndarray]
     compute_acf_general_theory: Callable[..., tuple[np.ndarray, np.ndarray]]
     compute_modulus: Callable[..., tuple[np.ndarray, np.ndarray]]
     compute_monomer_modulus: Callable[..., tuple[np.ndarray, np.ndarray, np.ndarray]]
-    dmap2cmap: Callable[..., np.ndarray]
     neighbor_balance_symmetric: Callable[..., np.ndarray]
     is_gpu_available: Callable[[], bool]
     get_gpu_name: Callable[[], str | None]
@@ -67,15 +69,12 @@ def _ensure_hipps_dimes_importable() -> None:
 def _load_bindings() -> HippsBindings:
     _ensure_hipps_dimes_importable()
     from hipps_dimes import (
-        a2cmap_theory,
-        a2dmap_theory,
         cmap2dmap,
         cmap2dmap_missing_data,
         compute_acf_general_theory,
         compute_m1_i,
         compute_modulus,
         compute_monomer_modulus,
-        dmap2cmap,
         get_gpu_name,
         is_gpu_available,
         neighbor_balance_symmetric,
@@ -85,15 +84,12 @@ def _load_bindings() -> HippsBindings:
 
     return HippsBindings(
         run_optimization=run_optimization,
-        a2cmap_theory=a2cmap_theory,
-        a2dmap_theory=a2dmap_theory,
         cmap2dmap=cmap2dmap,
         cmap2dmap_missing_data=cmap2dmap_missing_data,
         compute_m1_i=compute_m1_i,
         compute_acf_general_theory=compute_acf_general_theory,
         compute_modulus=compute_modulus,
         compute_monomer_modulus=compute_monomer_modulus,
-        dmap2cmap=dmap2cmap,
         neighbor_balance_symmetric=neighbor_balance_symmetric,
         is_gpu_available=is_gpu_available,
         get_gpu_name=get_gpu_name,
@@ -459,6 +455,22 @@ def _load_contact_map_from_source(bindings: HippsBindings, config: dict[str, Any
     raise ValueError(f"Unsupported input format for contact map target: {input_format}")
 
 
+def _load_input_matrix(bindings: HippsBindings, config: dict[str, Any]) -> np.ndarray:
+    input_type = config["input_type"]
+    input_path = config["input_path"]
+    input_format = config["input_format"]
+
+    if input_type == "cmap":
+        return np.asarray(_load_contact_map_from_source(bindings, config))
+    if input_format == "text":
+        return np.asarray(np.loadtxt(input_path))
+    if input_format == "npy":
+        return np.asarray(np.load(input_path))
+    raise ValueError(
+        f"input_type='{input_type}' only supports input_format={SUPPORTED_INPUT_FORMATS[input_type]}"
+    )
+
+
 def _normalize_contact_map(cmap: np.ndarray) -> np.ndarray:
     cmap = np.asarray(cmap, dtype=float)
     max_value = np.nanmax(cmap)
@@ -467,32 +479,22 @@ def _normalize_contact_map(cmap: np.ndarray) -> np.ndarray:
     return cmap / max_value
 
 
-def _build_target_matrices(bindings: HippsBindings, config: dict[str, Any]) -> dict[str, np.ndarray]:
-    input_path = config["input_path"]
+def _build_target_matrices(
+    bindings: HippsBindings,
+    config: dict[str, Any],
+    input_matrix: np.ndarray,
+) -> dict[str, np.ndarray]:
     input_type = config["input_type"]
-    input_format = config["input_format"]
 
     if input_type == "dmap":
-        if input_format == "text":
-            dmap_target = np.loadtxt(input_path)
-        elif input_format == "npy":
-            dmap_target = np.load(input_path)
-        else:
-            raise ValueError("input_type='dmap' only supports input_format='text' or 'npy'.")
-        return {"dmap_target": np.asarray(dmap_target, dtype=float)}
+        return {"dmap_target": np.asarray(input_matrix, dtype=float)}
 
     if input_type == "ddmap":
-        if input_format == "text":
-            ddmap_target = np.loadtxt(input_path)
-        elif input_format == "npy":
-            ddmap_target = np.load(input_path)
-        else:
-            raise ValueError("input_type='ddmap' only supports input_format='text' or 'npy'.")
-        dmap_target = np.sqrt((8.0 / (3.0 * np.pi)) * np.asarray(ddmap_target, dtype=float))
+        dmap_target = np.sqrt((8.0 / (3.0 * np.pi)) * np.asarray(input_matrix, dtype=float))
         return {"dmap_target": dmap_target}
 
     if input_type == "cmap":
-        cmap_target = _load_contact_map_from_source(bindings, config)
+        cmap_target = np.asarray(input_matrix, dtype=float)
         if config["neighbor_balance"]:
             cmap_target = bindings.neighbor_balance_symmetric(
                 cmap_target,
@@ -636,7 +638,11 @@ def _render_sidebar(bindings: HippsBindings) -> dict[str, Any] | None:
                 not_normalize = st.checkbox("Skip contact-map normalization", value=False)
 
             with st.expander("Output and robustness"):
-                save_steps = st.text_input("Save steps", value="", help="Comma-separated iterations.")
+                save_steps = st.text_input(
+                    "Save steps",
+                    value="",
+                    help="Comma-separated iterations. When Gaussian noise is enabled, HIPPS-DIMES requires an output prefix.",
+                )
                 no_log = st.checkbox("Skip CSV logs", value=False)
                 no_xyzs = st.checkbox("Skip XYZ generation", value=False)
                 ignore_missing_data = st.checkbox("Ignore missing data", value=False)
@@ -684,8 +690,20 @@ def _render_sidebar(bindings: HippsBindings) -> dict[str, Any] | None:
 def _validate_config(config: dict[str, Any]) -> tuple[bool, str | None]:
     if not config["input_path"].strip():
         return False, "An input file path is required."
+    supported_formats = SUPPORTED_INPUT_FORMATS[config["input_type"]]
+    if config["input_format"] not in supported_formats:
+        return False, (
+            f"Input type '{config['input_type']}' only supports formats: "
+            f"{', '.join(supported_formats)}."
+        )
     if config["input_format"] in {"cooler", "hic"} and not config["selection"].strip():
         return False, "Selection is required for cooler and .hic inputs."
+    try:
+        save_steps = _parse_save_steps(config["save_steps"])
+    except ValueError:
+        return False, "Save steps must be a comma-separated list of integers."
+    if save_steps is not None and config["gaussian_noise_variance"] > 0.0 and not config["output_prefix"].strip():
+        return False, "Output prefix is required when save steps are used with Gaussian noise."
     if config["gaussian_noise_variance"] > 0.0 and config["lamd"] > 0.0:
         return False, "Gaussian noise variance cannot be combined with lambda regularization."
     return True, None
@@ -695,9 +713,15 @@ def _run_model(bindings: HippsBindings, config: dict[str, Any]) -> RunArtifacts:
     normalized_path = _normalize_input_path(config["input_path"])
     output_prefix = _make_output_prefix(config["output_prefix"])
     save_steps = _parse_save_steps(config["save_steps"])
+    execution_config = dict(config)
+    execution_config["input_path"] = normalized_path
+    execution_config["output_prefix"] = output_prefix
+    execution_config["save_steps"] = save_steps
+    input_matrix = _load_input_matrix(bindings, execution_config)
 
     kwargs = {
         "input_path": normalized_path,
+        "input_matrix": input_matrix,
         "output_prefix": output_prefix,
         "ensemble": config["ensemble"],
         "alpha": config["alpha"],
@@ -736,29 +760,15 @@ def _run_model(bindings: HippsBindings, config: dict[str, Any]) -> RunArtifacts:
     runtime_seconds = time.perf_counter() - start
 
     try:
-        results.update(_build_target_matrices(bindings, config))
+        results.update(_build_target_matrices(bindings, execution_config, input_matrix))
     except Exception as exc:
         results["matrix_target_error"] = str(exc)
-
-    if config["input_type"] == "cmap" and "rc_optimal" in results:
-        results["cmap_final"] = bindings.dmap2cmap(
-            bindings.a2dmap_theory(
-                results["connectivity_matrix"],
-                force_positive_definite=True,
-            ),
-            results["rc_optimal"],
-        )
-
-    config_with_paths = dict(config)
-    config_with_paths["input_path"] = normalized_path
-    config_with_paths["output_prefix"] = output_prefix
-    config_with_paths["save_steps"] = save_steps
 
     return RunArtifacts(
         results=results,
         runtime_seconds=runtime_seconds,
         captured_stdout=stdout_buffer.getvalue().strip(),
-        config=config_with_paths,
+        config=execution_config,
     )
 
 
@@ -1186,6 +1196,7 @@ def main() -> None:
     if config is not None:
         valid, error_message = _validate_config(config)
         if not valid:
+            st.session_state.pop("artifacts", None)
             st.error(error_message)
         else:
             with st.spinner("Running HIPPS-DIMES..."):
