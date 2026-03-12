@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import contextlib
 import io
+import inspect
+import re
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -51,6 +54,231 @@ class RunArtifacts:
     runtime_seconds: float
     captured_stdout: str
     config: dict[str, Any]
+
+
+class _StreamlitOutputBuffer(io.TextIOBase):
+    _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+    _PROGRESS_RE = re.compile(
+        r"(?P<current>\d+)/(?P<total>\d+).*?loss=(?P<loss>[-+0-9.eE]+|nan|inf).*?entropy=(?P<entropy>[-+0-9.eE]+|nan|inf)",
+        re.IGNORECASE,
+    )
+
+    def __init__(
+        self,
+        placeholder: Any | None = None,
+        *,
+        progress_bar_placeholder: Any | None = None,
+        progress_summary_placeholder: Any | None = None,
+        entropy_chart_placeholder: Any | None = None,
+        max_lines: int = 18,
+        update_interval: float = 0.25,
+    ) -> None:
+        self._placeholder = placeholder
+        self._progress_bar_placeholder = progress_bar_placeholder
+        self._progress_summary_placeholder = progress_summary_placeholder
+        self._entropy_chart_placeholder = entropy_chart_placeholder
+        self._max_lines = max_lines
+        self._update_interval = update_interval
+        self._chart_update_interval = 0.75
+        self._full_buffer = io.StringIO()
+        self._history_lines: list[str] = []
+        self._current_line = ""
+        self._last_render = 0.0
+        self._last_chart_render = 0.0
+        self._progress_points: list[tuple[int, float]] = []
+        self._loss_points: list[tuple[int, float | None]] = []
+        self._last_progress_step = 0
+        self._progress_total: int | None = None
+        self._latest_loss: float | None = None
+        self._latest_entropy: float | None = None
+        self._last_chart_step_rendered = 0
+
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+    def writable(self) -> bool:
+        return True
+
+    def isatty(self) -> bool:
+        return False
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+
+        self._full_buffer.write(text)
+        clean_text = self._ANSI_RE.sub("", text)
+        for char in clean_text:
+            if char == "\r":
+                self._current_line = ""
+            elif char == "\n":
+                line = self._current_line.strip()
+                if line:
+                    self._history_lines.append(line)
+                    self._history_lines = self._history_lines[-self._max_lines :]
+                    self._capture_progress(line)
+                self._current_line = ""
+            elif char == "\b":
+                self._current_line = self._current_line[:-1]
+            else:
+                self._current_line += char
+
+        self._render()
+        return len(text)
+
+    def flush(self) -> None:
+        self._render(force=True)
+
+    def getvalue(self) -> str:
+        return self._full_buffer.getvalue()
+
+    def record_progress(self, update: dict[str, Any]) -> None:
+        try:
+            current = int(update.get("iteration") or 0)
+            total = int(update.get("total") or 0)
+        except (TypeError, ValueError):
+            return
+        if current <= self._last_progress_step:
+            return
+
+        loss = update.get("loss")
+        entropy = update.get("entropy")
+        self._last_progress_step = current
+        self._progress_total = total or None
+        self._latest_loss = None if loss is None or not np.isfinite(loss) else float(loss)
+        self._latest_entropy = None if entropy is None or not np.isfinite(entropy) else float(entropy)
+        self._loss_points.append((current, self._latest_loss))
+        if self._latest_entropy is not None:
+            self._progress_points.append((current, self._latest_entropy))
+        self._render()
+
+    def _render(self, *, force: bool = False) -> None:
+        now = time.perf_counter()
+        if not force and now - self._last_render < self._update_interval:
+            return
+
+        current = self._current_line.strip()
+        if current:
+            self._capture_progress(current)
+
+        lines = self._history_lines[-(self._max_lines - 1) :]
+        if current:
+            lines = lines + [current]
+        text = "\n".join(lines) if lines else "Waiting for HIPPS-DIMES output..."
+        if self._placeholder is not None:
+            self._placeholder.code(text)
+
+        if self._progress_bar_placeholder is not None and self._progress_total and self._last_progress_step:
+            fraction = min(max(self._last_progress_step / self._progress_total, 0.0), 1.0)
+            self._progress_bar_placeholder.progress(fraction)
+
+        if self._progress_summary_placeholder is not None and self._progress_total and self._last_progress_step:
+            loss_text = "nan" if self._latest_loss is None else f"{self._latest_loss:.4g}"
+            entropy_text = "nan" if self._latest_entropy is None else f"{self._latest_entropy:.4g}"
+            self._progress_summary_placeholder.caption(
+                f"Iteration {self._last_progress_step}/{self._progress_total} | "
+                f"loss {loss_text} | entropy {entropy_text}"
+            )
+
+        if (
+            self._entropy_chart_placeholder is not None
+            and self._progress_points
+            and self._last_progress_step > self._last_chart_step_rendered
+            and (
+                force
+                or self._progress_total == self._last_progress_step
+                or now - self._last_chart_render >= self._chart_update_interval
+            )
+        ):
+            loss_by_iteration = {iteration: loss for iteration, loss in self._loss_points}
+            chart_data = pd.DataFrame(
+                {
+                    "iteration": [iteration for iteration, _ in self._progress_points],
+                    "entropy": [entropy for _, entropy in self._progress_points],
+                }
+            )
+            chart_data["loss"] = chart_data["iteration"].map(loss_by_iteration)
+
+            entropy_chart = (
+                alt.Chart(chart_data)
+                .mark_line(color="#0f766e", strokeWidth=2.5)
+                .encode(
+                    x=alt.X("iteration:Q", title="Iteration"),
+                    y=alt.Y(
+                        "entropy:Q",
+                        title="Entropy",
+                        axis=alt.Axis(
+                            titleColor="#0f766e",
+                            labelColor="#0f766e",
+                            tickColor="#0f766e",
+                            domainColor="#0f766e",
+                        ),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("iteration:Q", title="Iteration"),
+                        alt.Tooltip("entropy:Q", title="Entropy", format=".4g"),
+                    ],
+                )
+            )
+
+            loss_chart = (
+                alt.Chart(chart_data)
+                .mark_line(color="#b45309", strokeWidth=2.5)
+                .encode(
+                    x=alt.X("iteration:Q", title="Iteration"),
+                    y=alt.Y(
+                        "loss:Q",
+                        title="Loss",
+                        axis=alt.Axis(
+                            titleColor="#b45309",
+                            labelColor="#b45309",
+                            tickColor="#b45309",
+                            domainColor="#b45309",
+                            orient="right",
+                        ),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("iteration:Q", title="Iteration"),
+                        alt.Tooltip("loss:Q", title="Loss", format=".4g"),
+                    ],
+                )
+            )
+
+            chart = (
+                alt.layer(entropy_chart, loss_chart)
+                .resolve_scale(y="independent")
+                .properties(height=280)
+                .configure_view(strokeOpacity=0)
+            )
+
+            self._entropy_chart_placeholder.altair_chart(
+                chart,
+                use_container_width=True,
+            )
+            self._last_chart_step_rendered = self._last_progress_step
+            self._last_chart_render = now
+
+        self._last_render = now
+
+    def _capture_progress(self, line: str) -> None:
+        match = self._PROGRESS_RE.search(line)
+        if not match:
+            return
+
+        current = int(match.group("current"))
+        total = int(match.group("total"))
+        if current <= self._last_progress_step:
+            return
+
+        loss = float(match.group("loss"))
+        entropy = float(match.group("entropy"))
+        self._last_progress_step = current
+        self._progress_total = total
+        self._latest_loss = loss
+        self._latest_entropy = entropy
+        self._loss_points.append((current, loss))
+        self._progress_points.append((current, entropy))
 
 
 def _ensure_hipps_dimes_importable() -> None:
@@ -807,7 +1035,14 @@ def _validate_config(config: dict[str, Any]) -> tuple[bool, str | None]:
     return True, None
 
 
-def _run_model(bindings: HippsBindings, config: dict[str, Any]) -> RunArtifacts:
+def _run_model(
+    bindings: HippsBindings,
+    config: dict[str, Any],
+    live_output_placeholder: Any | None = None,
+    live_progress_bar_placeholder: Any | None = None,
+    live_progress_summary_placeholder: Any | None = None,
+    live_entropy_chart_placeholder: Any | None = None,
+) -> RunArtifacts:
     normalized_path = _normalize_input_path(config["input_path"])
     output_prefix = _make_output_prefix(config["output_prefix"])
     save_steps = _parse_save_steps(config["save_steps"])
@@ -848,13 +1083,30 @@ def _run_model(bindings: HippsBindings, config: dict[str, Any]) -> RunArtifacts:
         "enforce_nonnegative_connectivity_matrix": config["enforce_nonnegative_connectivity_matrix"],
         "save_steps": save_steps,
         "eigh_threads": config["eigh_threads"],
-        "verbose": False,
+        "verbose": True,
     }
 
-    stdout_buffer = io.StringIO()
+    stdout_buffer = _StreamlitOutputBuffer(
+        live_output_placeholder,
+        progress_bar_placeholder=live_progress_bar_placeholder,
+        progress_summary_placeholder=live_progress_summary_placeholder,
+        entropy_chart_placeholder=live_entropy_chart_placeholder,
+    )
+    run_signature = inspect.signature(bindings.run_optimization)
+    native_progress_supported = (
+        "progress_callback" in run_signature.parameters
+        and "show_progress" in run_signature.parameters
+    )
+    if native_progress_supported:
+        kwargs["progress_callback"] = stdout_buffer.record_progress
+        kwargs["show_progress"] = False
+        kwargs["verbose"] = False
     start = time.perf_counter()
-    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stdout_buffer):
-        results = bindings.run_optimization(**kwargs)
+    try:
+        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stdout_buffer):
+            results = bindings.run_optimization(**kwargs)
+    finally:
+        stdout_buffer.flush()
     runtime_seconds = time.perf_counter() - start
 
     try:
@@ -1121,10 +1373,6 @@ def _render_overview(artifacts: RunArtifacts) -> None:
         ]
         st.markdown("\n".join(f"- {line}" for line in lines))
 
-        if artifacts.captured_stdout:
-            with st.expander("Captured stdout"):
-                st.code(artifacts.captured_stdout)
-
         st.download_button(
             "Download iteration series CSV",
             data=results["iteration_series"].to_csv(index=False),
@@ -1390,12 +1638,25 @@ def main() -> None:
             st.session_state.pop("artifacts", None)
             st.error(error_message)
         else:
-            with st.spinner("Running HIPPS-DIMES..."):
+            with st.status("Running HIPPS-DIMES...", expanded=True) as run_status:
+                st.caption("Live HIPPS-DIMES progress")
+                live_progress_bar_placeholder = st.empty()
+                live_progress_summary_placeholder = st.empty()
+                live_entropy_chart_placeholder = st.empty()
                 try:
-                    st.session_state["artifacts"] = _run_model(bindings, config)
+                    st.session_state["artifacts"] = _run_model(
+                        bindings,
+                        config,
+                        live_progress_bar_placeholder=live_progress_bar_placeholder,
+                        live_progress_summary_placeholder=live_progress_summary_placeholder,
+                        live_entropy_chart_placeholder=live_entropy_chart_placeholder,
+                    )
                 except Exception as exc:
                     st.session_state.pop("artifacts", None)
+                    run_status.update(label="HIPPS-DIMES run failed", state="error", expanded=True)
                     st.exception(exc)
+                else:
+                    run_status.update(label="HIPPS-DIMES run complete", state="complete", expanded=False)
 
     artifacts = st.session_state.get("artifacts")
     if artifacts is None:
