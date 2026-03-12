@@ -1,8 +1,10 @@
 # HIPPS-DIMES APP
 
-Streamlit workbench for running HIPPS-DIMES locally and inspecting the results interactively.
+![screenshot](/data/screenshot.png)
 
-This repository contains the app layer only. The numerical model and optimization code live in the main `HIPPS-DIMES` repository. The app calls the HIPPS-DIMES Python API directly, so you can configure runs, launch optimization, and inspect the returned matrices, structures, dynamics, and mechanics from one interface.
+Streamlit workbench for running [HIPPS-DIMES](https://github.com/anyuzx/HIPPS-DIMES) locally and inspecting the results interactively.
+
+This repository contains the app layer only. The numerical model and optimization code live in the main `HIPPS-DIMES` [repository](https://github.com/anyuzx/HIPPS-DIMES) - `refactor` branch. The app calls the HIPPS-DIMES Python API directly, so you can configure runs, launch optimization, and inspect the returned matrices, structures, dynamics, and mechanics from one interface.
 
 ## Features
 
