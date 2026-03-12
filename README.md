@@ -1,120 +1,94 @@
 # HIPPS-DIMES APP
 
-A standalone Streamlit app for running HIPPS-DIMES and inspecting the results locally.
+Streamlit workbench for running HIPPS-DIMES locally and inspecting the results interactively.
 
-This repo is separate from the main HIPPS-DIMES codebase. The app calls the HIPPS-DIMES Python API directly, so you can launch runs, inspect matrices, review convergence, and explore structure, dynamics, and mechanics in one place.
+This repository contains the app layer only. The numerical model and optimization code live in the main `HIPPS-DIMES` repository. The app calls the HIPPS-DIMES Python API directly, so you can configure runs, launch optimization, and inspect the returned matrices, structures, dynamics, and mechanics from one interface.
 
-## What the app does
+## Features
 
-- Runs `run_optimization()` directly instead of shelling out to the CLI
-- Visualizes distance maps, contact maps, and connectivity matrices
-- Compares target vs HIPPS-DIMES result in the Matrices tab
-- Shows convergence curves from the iteration series
-- Renders sampled 3D structures from returned `xyzs`
-- Computes theory-based dynamics and mechanics plots from the final connectivity matrix
+- Run `run_optimization()` directly from a Streamlit UI
+- Inspect distance maps, contact maps, and connectivity matrices
+- Compare target matrices against HIPPS-DIMES output
+- Review convergence curves and live optimization progress
+- Visualize sampled 3D structures
+- Compute dynamics and mechanics observables from the final connectivity matrix
+- Browse local files and inspect available `.cool` / `.mcool` groups before launching a run
 
-## Repo layout
+## Repository scope
 
-The intended layout is:
+- This repo is a local desktop app, not a hosted web service.
+- Input files are read from your local filesystem.
+- No data is uploaded anywhere by the app itself.
+- You still need the main `HIPPS-DIMES` package installed in the same Python environment.
+
+## Recommended layout
+
+Clone the app repo next to the core repo:
 
 ```text
-Code/
+workspace/
 |-- HIPPS-DIMES
-`-- HIPPS-DIMES-GUI
+`-- HIPPS-DIMES-APP
 ```
 
-The app can try to import HIPPS-DIMES from the sibling repo automatically, but the clean setup is to install both repos into the same Python environment.
+The app can also import HIPPS-DIMES from an installed package, but the side-by-side layout above is the simplest setup for development.
 
 ## Installation
 
-### Recommended: mamba environment + uv install
+### Option 1: `uv` virtual environment
 
 ```bash
-mamba create -n hipps-dimes-gui python=3.11 pip
-mamba activate hipps-dimes-gui
-mamba install -c conda-forge uv
+git clone <HIPPS-DIMES-url>
+git clone <HIPPS-DIMES-APP-url>
 
-uv pip install -e /Users/guangshi/Library/CloudStorage/Dropbox/Documents/Work-Document/Code/HIPPS-DIMES
-uv pip install -e /Users/guangshi/Library/CloudStorage/Dropbox/Documents/Work-Document/Code/HIPPS-DIMES-GUI
-```
-
-### uv virtual environment
-
-```bash
-cd /Users/guangshi/Library/CloudStorage/Dropbox/Documents/Work-Document/Code/HIPPS-DIMES-GUI
+cd HIPPS-DIMES-APP
 uv venv
 source .venv/bin/activate
 uv pip install -e ../HIPPS-DIMES
 uv pip install -e .
 ```
 
-### pip virtual environment
+### Option 2: `pip` virtual environment
 
 ```bash
-cd /Users/guangshi/Library/CloudStorage/Dropbox/Documents/Work-Document/Code/HIPPS-DIMES-GUI
+git clone <HIPPS-DIMES-url>
+git clone <HIPPS-DIMES-APP-url>
+
+cd HIPPS-DIMES-APP
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ../HIPPS-DIMES
 pip install -e .
 ```
 
+### Option 3: Conda or mamba environment
+
+```bash
+git clone <HIPPS-DIMES-url>
+git clone <HIPPS-DIMES-APP-url>
+
+mamba create -n hipps-dimes-app python=3.11 pip
+mamba activate hipps-dimes-app
+pip install -e ./HIPPS-DIMES
+pip install -e ./HIPPS-DIMES-APP
+```
+
 ## Launch
 
 ```bash
-cd /Users/guangshi/Library/CloudStorage/Dropbox/Documents/Work-Document/Code/HIPPS-DIMES-GUI
+cd HIPPS-DIMES-APP
 streamlit run app.py
 ```
 
-If you are using a virtual environment, activate it first.
-
 ## Quick start
 
-1. Set the top `Input file path` field to your file.
+1. Set `Input file path` to a local file.
 2. Choose the correct `Input type` and `Input format`.
 3. For `cooler` and `.hic` inputs, fill in `Selection / region`.
-4. Set optimization parameters in the sidebar.
+4. Adjust optimization parameters in the sidebar.
 5. Click `Run HIPPS-DIMES`.
 
-## Input fields
-
-### `Input file path`
-
-This is the actual path that HIPPS-DIMES will use. If you already know the full path, paste it here directly.
-
-Examples:
-
-```text
-/path/to/contact_map.txt
-/path/to/contact_map.npy
-/path/to/data.cool
-/path/to/data.mcool::/resolutions/10000
-/path/to/data.hic
-```
-
-### `Browse local files`
-
-This is a filesystem navigator that helps fill in the top `Input file path`. It does not replace the top field.
-
-- `Directory`: folder to browse, not a file path
-- `Go`: open the folder typed in `Directory`
-- `Up`: go to the parent folder
-- `Home`: go to your home directory
-- `Sync`: jump the browser to the folder implied by the current `Input file path`
-- `Hidden`: show dotfiles and dotfolders
-- `All files`: show all suffixes; otherwise the browser filters to likely HIPPS-DIMES inputs such as `.txt`, `.csv`, `.npy`, `.cool`, `.mcool`, `.hic`
-- `Folders` + `Open folder`: navigate into a selected folder
-- `Files` + `Use file`: copy the selected file path into the top `Input file path`
-
-Important:
-
-- If you paste a full file path into `Directory`, `Go` will not work, because that control expects a folder.
-- For multires cooler files, use `Use file` first, then manually append the group to the top field, for example:
-
-```text
-/path/to/data.mcool::/resolutions/10000
-```
-
-## Input types and formats
+## Supported inputs
 
 ### Contact maps
 
@@ -139,51 +113,86 @@ Use:
 - `Input type = ddmap`
 - `Input format = text` or `npy`
 
-## What appears in the tabs
+## File browser and cooler groups
+
+The sidebar includes a local filesystem browser to help populate `Input file path`.
+
+- `Directory`: browse a folder
+- `Go`, `Up`, `Home`, `Sync`: navigate quickly
+- `Files` -> `Use file`: copy the selected file into `Input file path`
+- `Cooler groups / resolutions`: inspect available groups in `.cool` / `.mcool` files and append the selected group to `Input file path` automatically
+
+Examples:
+
+```text
+/path/to/contact_map.txt
+/path/to/contact_map.npy
+/path/to/data.cool
+/path/to/data.mcool::/resolutions/10000
+/path/to/data.hic
+```
+
+## App tabs
+
+### Overview
+
+Run metadata, output availability, and download actions.
 
 ### Matrices
 
-- `Final distance map`: lower triangle is the target dmap, upper triangle is the HIPPS-DIMES result
-- `Final contact map`: lower triangle is the target cmap, upper triangle is the HIPPS-DIMES result
-- `Connectivity matrix`: final learned connectivity matrix
+- Final distance map
+- Final contact map
+- Final connectivity matrix
+- Target vs HIPPS-DIMES matrix comparisons
 
 ### Convergence
 
-- Loss and entropy across iterations
+Loss and entropy across optimization iterations.
 
 ### 3D Structure
 
-- Sampled structures from the final connectivity matrix
+Sampled structures from the final connectivity matrix.
 
-### Dynamics and Mechanics
+### Dynamics
 
-- Theory-based observables derived from the final connectivity matrix
+Theory-based dynamics observables derived from the optimized model.
 
-## Practical notes
+### Mechanics
 
-- For large `.cool` and `.hic` files, path-based loading is better than a browser upload widget.
-- If GPU support is available in the environment, the sidebar exposes it automatically.
-- The default sample path points to `../HIPPS-DIMES/data/IMR90_chr21-28-30Mb.csv` when that file exists.
-- If XYZ writing fails for a run, try clearing `Output prefix` or turning on `Skip XYZ generation`.
+Bulk and per-locus modulus calculations from the optimized connectivity matrix.
+
+## Notes
+
+- Large `.cool` and `.hic` inputs are better handled as local paths than as browser uploads.
+- GPU options appear automatically when HIPPS-DIMES detects a supported GPU environment.
+- The app keeps the most recent run in memory for interactive inspection.
+- For noisy runs with `save_steps`, HIPPS-DIMES requires an `Output prefix`.
 
 ## Troubleshooting
 
-### I pasted a file path into `Directory` and nothing happened
+### The app cannot import HIPPS-DIMES
 
-`Directory` expects a folder path. Paste the file path into the top `Input file path` field instead, or paste the parent folder into `Directory` and browse from there.
+Make sure both repositories are installed into the same environment:
 
-### My `.cool` or `.hic` input does not run
+```bash
+pip install -e ../HIPPS-DIMES
+pip install -e .
+```
+
+### My `.mcool` file does not run
+
+Make sure:
+
+- `Input type = cmap`
+- `Input format = cooler`
+- `Selection / region` is filled in
+- the correct cooler group or resolution is selected in the sidebar
+
+### My `.hic` input does not run
 
 Check:
 
 - `Input type = cmap`
-- `Input format` matches the file
-- `Selection / region` is filled in for `cooler` and `hic`
-
-### My `.mcool` file does not work directly
-
-Use the multires group syntax in `Input file path`, for example:
-
-```text
-/path/to/data.mcool::/resolutions/10000
-```
+- `Input format = hic`
+- `Selection / region` is filled in
+- `Hi-C binsize`, normalization, and unit match the file
