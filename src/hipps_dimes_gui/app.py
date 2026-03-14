@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import io
 import inspect
+import json
+import pickle
 import re
 import sys
 import time
@@ -25,6 +27,17 @@ APP_SUBTITLE = "Run local reconstructions, inspect matrices, and explore dynamic
 INPUT_FILE_SUFFIXES = (".txt", ".csv", ".npy", ".cool", ".mcool", ".hic")
 MAX_BROWSER_ENTRIES = 2000
 COOLER_FILE_SUFFIXES = {".cool", ".mcool"}
+RESULT_FILE_SUFFIXES = (
+    "_connectivity_matrix.txt",
+    "_dmap_final.txt",
+    "_cmap_final.txt",
+    "_cmap_target.txt",
+    "_iteration_series.csv",
+    "_run_parameters.csv",
+    ".xyz",
+)
+RESULT_PICKLE_SUFFIXES = (".pkl", ".pickle")
+ITERATION_SERIES_COLUMNS = ["iteration", "loss", "entropy"]
 SUPPORTED_INPUT_FORMATS = {
     "cmap": ("text", "npy", "cooler", "hic"),
     "dmap": ("text", "npy"),
@@ -35,6 +48,7 @@ SUPPORTED_INPUT_FORMATS = {
 @dataclass
 class HippsBindings:
     run_optimization: Callable[..., dict[str, Any]]
+    a2xyz_sample: Callable[..., np.ndarray]
     cmap2dmap: Callable[..., np.ndarray]
     cmap2dmap_missing_data: Callable[..., np.ndarray]
     compute_m1_i: Callable[..., np.ndarray]
@@ -298,6 +312,7 @@ def _ensure_hipps_dimes_importable() -> None:
 def _load_bindings() -> HippsBindings:
     _ensure_hipps_dimes_importable()
     from hipps_dimes import (
+        a2xyz_sample,
         cmap2dmap,
         cmap2dmap_missing_data,
         compute_acf_general_theory,
@@ -313,6 +328,7 @@ def _load_bindings() -> HippsBindings:
 
     return HippsBindings(
         run_optimization=run_optimization,
+        a2xyz_sample=a2xyz_sample,
         cmap2dmap=cmap2dmap,
         cmap2dmap_missing_data=cmap2dmap_missing_data,
         compute_m1_i=compute_m1_i,
@@ -722,6 +738,479 @@ def _make_output_prefix(raw_value: str) -> str | None:
     return str(path.resolve())
 
 
+def _normalize_existing_result_prefix(raw_value: str) -> str:
+    stripped = raw_value.strip()
+    if not stripped:
+        return ""
+
+    path = Path(stripped).expanduser().resolve(strict=False)
+    normalized = str(path)
+    for suffix in sorted(RESULT_FILE_SUFFIXES, key=len, reverse=True):
+        if normalized.endswith(suffix):
+            return normalized[: -len(suffix)]
+
+    checkpoint_match = re.search(r"_connectivity_matrix_iter\d+\.txt$", normalized)
+    if checkpoint_match:
+        return normalized[: checkpoint_match.start()]
+
+    return normalized
+
+
+def _is_pickle_result_path(raw_value: str) -> bool:
+    return Path(raw_value.strip()).suffix.lower() in RESULT_PICKLE_SUFFIXES
+
+
+def _empty_iteration_series_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=ITERATION_SERIES_COLUMNS)
+
+
+def _parse_saved_run_parameter(value: Any) -> Any:
+    if pd.isna(value):
+        return None
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (bool, int, float, list, dict)):
+        return value
+
+    text = str(value).strip()
+    if text == "":
+        return ""
+    if text == "None":
+        return None
+    if text in {"True", "False"}:
+        return text == "True"
+
+    if text.startswith(("[", "{", '"')):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+    try:
+        if any(char in text for char in (".", "e", "E")):
+            return float(text)
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _load_saved_run_parameters(run_parameters_path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+    frame = pd.read_csv(run_parameters_path)
+    if {"parameter", "value"} - set(frame.columns):
+        raise ValueError("Run parameters file must contain 'parameter' and 'value' columns.")
+
+    parameter_map = {
+        str(row["parameter"]): _parse_saved_run_parameter(row["value"])
+        for _, row in frame.iterrows()
+    }
+    return frame, parameter_map
+
+
+def _bool_value(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.lower() == "true"
+    return bool(value)
+
+
+def _int_value(value: Any, default: int | None = None) -> int | None:
+    if value in {None, ""}:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_value(value: Any, default: float) -> float:
+    if value in {None, ""}:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_loaded_config(
+    result_prefix: str,
+    parameter_map: dict[str, Any] | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    parameter_map = parameter_map or {}
+    overrides = overrides or {}
+    input_source = parameter_map.get("input_source")
+    input_path = input_source if isinstance(input_source, str) and input_source != "NumPy array" else ""
+
+    config = {
+        "mode": "load",
+        "input_path": _normalize_input_path(str(input_path)) if input_path else "",
+        "output_prefix": result_prefix,
+        "input_type": str(parameter_map.get("input_type") or "dmap"),
+        "input_format": str(parameter_map.get("input_format") or "text"),
+        "selection": str(parameter_map.get("selection") or ""),
+        "method": str(parameter_map.get("method") or "IS"),
+        "ensemble": _int_value(parameter_map.get("ensemble"), 100),
+        "iteration": _int_value(parameter_map.get("iteration"), 0),
+        "alpha": _float_value(parameter_map.get("alpha"), 4.0),
+        "learning_rate": _float_value(parameter_map.get("learning_rate"), 10.0),
+        "momentum": _float_value(parameter_map.get("momentum"), 0.0),
+        "nesterov": _bool_value(parameter_map.get("nesterov"), False),
+        "use_gpu": _bool_value(parameter_map.get("use_gpu_requested"), False),
+        "gpu_float32": _bool_value(parameter_map.get("gpu_float32"), False),
+        "eigh_threads": _int_value(parameter_map.get("eigh_threads"), None),
+        "lamd": _float_value(parameter_map.get("lamd"), 0.0),
+        "reg": str(parameter_map.get("reg") or "L2"),
+        "gaussian_noise_variance": _float_value(parameter_map.get("gaussian_noise_variance"), 0.0),
+        "binsize": _int_value(parameter_map.get("binsize"), 25000),
+        "hic_norm": str(parameter_map.get("hic_norm") or "KR"),
+        "hic_unit": str(parameter_map.get("hic_unit") or "BP"),
+        "balance": _bool_value(parameter_map.get("balance"), False),
+        "neighbor_balance": _bool_value(parameter_map.get("neighbor_balance"), False),
+        "not_normalize": _bool_value(parameter_map.get("not_normalize"), False),
+        "save_steps": parameter_map.get("save_steps") or [],
+        "no_log": _bool_value(parameter_map.get("no_log"), False),
+        "no_xyzs": _bool_value(parameter_map.get("no_xyzs"), False),
+        "ignore_missing_data": _bool_value(parameter_map.get("ignore_missing_data"), False),
+        "enforce_nonnegative_connectivity_matrix": _bool_value(
+            parameter_map.get("enforce_nonnegative_connectivity_matrix"),
+            False,
+        ),
+    }
+
+    if overrides.get("enabled"):
+        override_input_path = overrides.get("input_path", "").strip()
+        override_selection = overrides.get("selection", "")
+        config.update(
+            {
+                "input_path": _normalize_input_path(override_input_path) if override_input_path else config["input_path"],
+                "input_type": overrides.get("input_type", config["input_type"]),
+                "input_format": overrides.get("input_format", config["input_format"]),
+                "selection": override_selection if override_selection else config["selection"],
+                "alpha": float(overrides.get("alpha", config["alpha"])),
+                "balance": bool(overrides.get("balance", False)),
+                "neighbor_balance": bool(overrides.get("neighbor_balance", False)),
+                "not_normalize": bool(overrides.get("not_normalize", False)),
+                "ignore_missing_data": bool(overrides.get("ignore_missing_data", False)),
+                "binsize": int(overrides.get("binsize", config["binsize"])),
+                "hic_norm": overrides.get("hic_norm", config["hic_norm"]),
+                "hic_unit": overrides.get("hic_unit", config["hic_unit"]),
+            }
+        )
+
+    return config
+
+
+def _build_minimal_run_parameters_frame(config: dict[str, Any]) -> pd.DataFrame:
+    rows = [
+        ("input_source", config.get("input_path", "")),
+        ("output_prefix", config.get("output_prefix")),
+        ("input_type", config.get("input_type")),
+        ("input_format", config.get("input_format")),
+        ("selection", config.get("selection")),
+    ]
+    return pd.DataFrame(rows, columns=["parameter", "value"])
+
+
+def _coerce_iteration_series_frame(data: Any) -> pd.DataFrame:
+    if data is None:
+        return _empty_iteration_series_frame()
+    if isinstance(data, pd.DataFrame):
+        frame = data.copy()
+    else:
+        frame = pd.DataFrame(data)
+    if frame.empty:
+        return _empty_iteration_series_frame()
+    missing = [column for column in ITERATION_SERIES_COLUMNS if column not in frame.columns]
+    if missing:
+        raise ValueError(
+            "Iteration series must contain columns: "
+            + ", ".join(ITERATION_SERIES_COLUMNS)
+        )
+    return frame
+
+
+def _coerce_run_parameters_artifact(data: Any) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    if data is None:
+        return None, {}
+    if isinstance(data, pd.DataFrame):
+        frame = data.copy()
+    elif isinstance(data, dict):
+        frame = pd.DataFrame(
+            {
+                "parameter": [str(key) for key in data.keys()],
+                "value": list(data.values()),
+            }
+        )
+    else:
+        raise ValueError("Run parameters must be a DataFrame or dict.")
+
+    if {"parameter", "value"} - set(frame.columns):
+        raise ValueError("Run parameters must contain 'parameter' and 'value' columns.")
+
+    parameter_map = {
+        str(row["parameter"]): _parse_saved_run_parameter(row["value"])
+        for _, row in frame.iterrows()
+    }
+    return frame, parameter_map
+
+
+def _coerce_checkpoint_artifact(data: Any) -> dict[int, np.ndarray]:
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("connectivity_matrix_at_steps must be a dict.")
+
+    checkpoints: dict[int, np.ndarray] = {}
+    for step, matrix in data.items():
+        checkpoints[int(step)] = np.asarray(matrix, dtype=float)
+    return dict(sorted(checkpoints.items()))
+
+
+def _coerce_results_mapping(results: dict[str, Any]) -> dict[str, Any]:
+    if "connectivity_matrix" not in results or "dmap_final" not in results:
+        raise ValueError("Pickled HIPPS-DIMES results must include 'connectivity_matrix' and 'dmap_final'.")
+
+    normalized = dict(results)
+    iteration_series = _coerce_iteration_series_frame(
+        normalized.get("iteration_series", normalized.get("log"))
+    )
+    normalized["iteration_series"] = iteration_series
+    normalized["log"] = iteration_series
+    normalized["connectivity_matrix"] = np.asarray(normalized["connectivity_matrix"], dtype=float)
+    normalized["dmap_final"] = np.asarray(normalized["dmap_final"], dtype=float)
+
+    if "cmap_final" in normalized and normalized["cmap_final"] is not None:
+        normalized["cmap_final"] = np.asarray(normalized["cmap_final"], dtype=float)
+    if "dmap_target" in normalized and normalized["dmap_target"] is not None:
+        normalized["dmap_target"] = np.asarray(normalized["dmap_target"], dtype=float)
+    if "cmap_target" in normalized and normalized["cmap_target"] is not None:
+        normalized["cmap_target"] = np.asarray(normalized["cmap_target"], dtype=float)
+    if "xyzs" in normalized and normalized["xyzs"] is not None:
+        normalized["xyzs"] = np.asarray(normalized["xyzs"], dtype=float)
+    if "connectivity_matrix_at_steps" in normalized:
+        normalized["connectivity_matrix_at_steps"] = _coerce_checkpoint_artifact(
+            normalized["connectivity_matrix_at_steps"]
+        )
+
+    return normalized
+
+
+def _load_xyz_ensemble(xyz_path: Path) -> np.ndarray:
+    snapshots: list[np.ndarray] = []
+    lines = xyz_path.read_text().splitlines()
+    cursor = 0
+
+    while cursor < len(lines):
+        line = lines[cursor].strip()
+        if not line:
+            cursor += 1
+            continue
+
+        natoms = int(line)
+        cursor += 1
+        if cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1
+
+        coords = []
+        for _ in range(natoms):
+            if cursor >= len(lines):
+                raise ValueError(f"Unexpected end of XYZ file in {xyz_path}.")
+            parts = lines[cursor].split()
+            if len(parts) < 4:
+                raise ValueError(f"Malformed XYZ line in {xyz_path}: {lines[cursor]!r}")
+            coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            cursor += 1
+
+        snapshots.append(np.asarray(coords, dtype=float))
+
+    if not snapshots:
+        raise ValueError(f"No XYZ snapshots found in {xyz_path}.")
+    return np.asarray(snapshots, dtype=float)
+
+
+def _load_connectivity_checkpoints(result_prefix: str) -> dict[int, np.ndarray]:
+    prefix_path = Path(result_prefix)
+    pattern = f"{prefix_path.name}_connectivity_matrix_iter*.txt"
+    checkpoints: dict[int, np.ndarray] = {}
+    for checkpoint_path in prefix_path.parent.glob(pattern):
+        match = re.search(r"_connectivity_matrix_iter(\d+)\.txt$", checkpoint_path.name)
+        if not match:
+            continue
+        checkpoints[int(match.group(1))] = np.asarray(np.loadtxt(checkpoint_path), dtype=float)
+    return dict(sorted(checkpoints.items()))
+
+
+def _build_loaded_target_matrices(
+    bindings: HippsBindings,
+    result_prefix: str,
+    config: dict[str, Any],
+) -> dict[str, np.ndarray | str]:
+    cmap_target_path = Path(f"{result_prefix}_cmap_target.txt")
+    if cmap_target_path.exists():
+        raw_cmap_target = np.asarray(np.loadtxt(cmap_target_path), dtype=float)
+        updates: dict[str, np.ndarray | str] = {
+            "cmap_target": _normalize_contact_map(raw_cmap_target),
+        }
+        if config.get("input_type") == "cmap":
+            if config.get("ignore_missing_data"):
+                dmap_target = bindings.cmap2dmap_missing_data(
+                    raw_cmap_target,
+                    config["alpha"],
+                    config["not_normalize"],
+                )
+            else:
+                dmap_target = bindings.cmap2dmap(
+                    raw_cmap_target,
+                    config["alpha"],
+                    config["not_normalize"],
+                )
+            updates["dmap_target"] = np.asarray(dmap_target, dtype=float)
+        return updates
+
+    if not config.get("input_path"):
+        return {}
+
+    input_matrix = _load_input_matrix(bindings, config)
+    return _build_target_matrices(bindings, config, input_matrix)
+
+
+def _load_pickled_results(
+    bindings: HippsBindings,
+    pickle_path: Path,
+    request: dict[str, Any],
+) -> RunArtifacts:
+    with pickle_path.open("rb") as handle:
+        payload = pickle.load(handle)
+
+    if isinstance(payload, RunArtifacts):
+        raw_results = payload.results
+        raw_config = payload.config
+        runtime_seconds = payload.runtime_seconds
+        captured_stdout = payload.captured_stdout
+    elif isinstance(payload, dict) and isinstance(payload.get("results"), dict):
+        raw_results = payload["results"]
+        raw_config = payload.get("config", {})
+        runtime_seconds = float(payload.get("runtime_seconds", np.nan))
+        captured_stdout = str(payload.get("captured_stdout", ""))
+    elif hasattr(payload, "results") and isinstance(getattr(payload, "results"), dict):
+        raw_results = getattr(payload, "results")
+        raw_config = getattr(payload, "config", {})
+        runtime_seconds = float(getattr(payload, "runtime_seconds", np.nan))
+        captured_stdout = str(getattr(payload, "captured_stdout", ""))
+    elif isinstance(payload, dict):
+        raw_results = payload
+        raw_config = {}
+        runtime_seconds = np.nan
+        captured_stdout = ""
+    else:
+        raise ValueError(
+            "Unsupported pickle payload. Expected a HIPPS-DIMES results dict or a RunArtifacts-like object."
+        )
+
+    results = _coerce_results_mapping(raw_results)
+    run_parameters_frame, parameter_map = _coerce_run_parameters_artifact(results.get("run_parameters"))
+
+    pickle_prefix = str(pickle_path.with_suffix(""))
+    config = _build_loaded_config(pickle_prefix, parameter_map, request.get("overrides"))
+    if isinstance(raw_config, dict):
+        config.update(raw_config)
+    config["mode"] = "load"
+    config["loaded_from"] = str(pickle_path)
+    config["output_prefix"] = str(config.get("output_prefix") or pickle_prefix)
+    if config.get("input_path"):
+        config["input_path"] = _normalize_input_path(str(config["input_path"]))
+
+    if run_parameters_frame is None:
+        results["run_parameters"] = _build_minimal_run_parameters_frame(config)
+    else:
+        results["run_parameters"] = run_parameters_frame
+
+    if "matrix_target_error" not in results and "dmap_target" not in results and "cmap_target" not in results:
+        try:
+            target_prefix = str(config.get("output_prefix") or pickle_prefix)
+            results.update(_build_loaded_target_matrices(bindings, target_prefix, config))
+        except Exception as exc:
+            results["matrix_target_error"] = str(exc)
+
+    return RunArtifacts(
+        results=results,
+        runtime_seconds=runtime_seconds if np.isfinite(runtime_seconds) else np.nan,
+        captured_stdout=captured_stdout,
+        config=config,
+    )
+
+
+def _load_existing_results(bindings: HippsBindings, request: dict[str, Any]) -> RunArtifacts:
+    raw_result_reference = request["result_prefix"].strip()
+    if _is_pickle_result_path(raw_result_reference):
+        pickle_path = Path(raw_result_reference).expanduser().resolve(strict=False)
+        if not pickle_path.exists():
+            raise FileNotFoundError(f"Missing pickle file: {pickle_path}")
+        return _load_pickled_results(bindings, pickle_path, request)
+
+    result_prefix = _normalize_existing_result_prefix(request["result_prefix"])
+    if not result_prefix:
+        raise ValueError("A result prefix or an existing HIPPS-DIMES output file is required.")
+
+    connectivity_path = Path(f"{result_prefix}_connectivity_matrix.txt")
+    dmap_path = Path(f"{result_prefix}_dmap_final.txt")
+    if not connectivity_path.exists():
+        raise FileNotFoundError(f"Missing required file: {connectivity_path}")
+    if not dmap_path.exists():
+        raise FileNotFoundError(f"Missing required file: {dmap_path}")
+
+    run_parameters_path = Path(f"{result_prefix}_run_parameters.csv")
+    if run_parameters_path.exists():
+        run_parameters, parameter_map = _load_saved_run_parameters(run_parameters_path)
+    else:
+        run_parameters = None
+        parameter_map = {}
+
+    config = _build_loaded_config(result_prefix, parameter_map, request.get("overrides"))
+
+    results: dict[str, Any] = {
+        "iteration_series": _empty_iteration_series_frame(),
+        "log": _empty_iteration_series_frame(),
+        "run_parameters": run_parameters if run_parameters is not None else _build_minimal_run_parameters_frame(config),
+        "dmap_final": np.asarray(np.loadtxt(dmap_path), dtype=float),
+        "connectivity_matrix": np.asarray(np.loadtxt(connectivity_path), dtype=float),
+    }
+
+    iteration_series_path = Path(f"{result_prefix}_iteration_series.csv")
+    if iteration_series_path.exists():
+        iteration_series = pd.read_csv(iteration_series_path)
+        results["iteration_series"] = iteration_series
+        results["log"] = iteration_series
+
+    cmap_final_path = Path(f"{result_prefix}_cmap_final.txt")
+    if cmap_final_path.exists():
+        results["cmap_final"] = np.asarray(np.loadtxt(cmap_final_path), dtype=float)
+
+    checkpoints = _load_connectivity_checkpoints(result_prefix)
+    if checkpoints:
+        results["connectivity_matrix_at_steps"] = checkpoints
+
+    xyz_path = Path(f"{result_prefix}.xyz")
+    if xyz_path.exists():
+        try:
+            results["xyzs"] = _load_xyz_ensemble(xyz_path)
+        except Exception as exc:
+            results["xyz_load_error"] = str(exc)
+
+    try:
+        results.update(_build_loaded_target_matrices(bindings, result_prefix, config))
+    except Exception as exc:
+        results["matrix_target_error"] = str(exc)
+
+    return RunArtifacts(
+        results=results,
+        runtime_seconds=np.nan,
+        captured_stdout="",
+        config=config,
+    )
+
+
 def _load_contact_map_from_source(bindings: HippsBindings, config: dict[str, Any]) -> np.ndarray:
     input_path = config["input_path"]
     input_format = config["input_format"]
@@ -980,6 +1469,7 @@ def _render_sidebar(bindings: HippsBindings) -> dict[str, Any] | None:
             return None
 
         config = {
+            "mode": "run",
             "input_path": st.session_state.get("input_path", ""),
             "output_prefix": output_prefix,
             "input_type": input_type,
@@ -1013,6 +1503,77 @@ def _render_sidebar(bindings: HippsBindings) -> dict[str, Any] | None:
         return config
 
 
+def _render_load_results_sidebar() -> dict[str, Any] | None:
+    with st.sidebar:
+        st.header("Load Results")
+        st.caption(
+            "Load an existing HIPPS-DIMES result set from its output prefix, any one of its standard output files, "
+            "or a trusted Python pickle file."
+        )
+        st.warning("Only load `.pkl` or `.pickle` files you trust.")
+
+        with st.form("load_results_form", clear_on_submit=False):
+            result_prefix = st.text_input(
+                "Result prefix or output file",
+                value="",
+                help=(
+                    "Examples: `/path/to/run`, `/path/to/run_connectivity_matrix.txt`, "
+                    "`/path/to/run_iteration_series.csv`, or `/path/to/run_results.pkl`."
+                ),
+            )
+
+            override_enabled = st.checkbox(
+                "Override input metadata for target reconstruction",
+                value=False,
+                help="Use this if `run_parameters.csv` is missing or the original input file moved.",
+            )
+            with st.expander("Optional input metadata override", expanded=override_enabled):
+                override_input_path = st.text_input(
+                    "Original input path",
+                    value="",
+                    help="Only needed if you want the app to rebuild target matrices from the original input.",
+                )
+                input_col, format_col = st.columns(2)
+                override_input_type = input_col.selectbox("Input type", ["cmap", "dmap", "ddmap"], index=0, key="load_input_type")
+                override_input_format = format_col.selectbox("Input format", ["text", "npy", "cooler", "hic"], index=0, key="load_input_format")
+                override_selection = st.text_input("Selection / region", value="", key="load_selection")
+                override_alpha = st.number_input("Alpha", min_value=0.1, value=4.0, step=0.1, key="load_alpha")
+                binsize_col, norm_col = st.columns(2)
+                override_binsize = binsize_col.number_input("Hi-C binsize", min_value=1, value=25000, step=1000, key="load_binsize")
+                override_hic_norm = norm_col.selectbox("Hi-C norm", ["KR", "VC", "NONE"], index=0, key="load_hic_norm")
+                unit_col, balance_col = st.columns(2)
+                override_hic_unit = unit_col.selectbox("Hi-C unit", ["BP", "FRAG"], index=0, key="load_hic_unit")
+                override_balance = balance_col.checkbox("Cooler balance", value=False, key="load_balance")
+                override_neighbor_balance = st.checkbox("Neighbor balance", value=False, key="load_neighbor_balance")
+                override_not_normalize = st.checkbox("Skip contact-map normalization", value=False, key="load_not_normalize")
+                override_ignore_missing_data = st.checkbox("Ignore missing data", value=False, key="load_ignore_missing_data")
+
+            load_clicked = st.form_submit_button("Load existing results", use_container_width=True)
+
+        if not load_clicked:
+            return None
+
+        return {
+            "mode": "load",
+            "result_prefix": result_prefix,
+            "overrides": {
+                "enabled": bool(override_enabled),
+                "input_path": override_input_path,
+                "input_type": override_input_type,
+                "input_format": override_input_format,
+                "selection": override_selection,
+                "alpha": float(override_alpha),
+                "binsize": int(override_binsize),
+                "hic_norm": override_hic_norm,
+                "hic_unit": override_hic_unit,
+                "balance": bool(override_balance),
+                "neighbor_balance": bool(override_neighbor_balance),
+                "not_normalize": bool(override_not_normalize),
+                "ignore_missing_data": bool(override_ignore_missing_data),
+            },
+        }
+
+
 def _validate_config(config: dict[str, Any]) -> tuple[bool, str | None]:
     if not config["input_path"].strip():
         return False, "An input file path is required."
@@ -1032,6 +1593,12 @@ def _validate_config(config: dict[str, Any]) -> tuple[bool, str | None]:
         return False, "Output prefix is required when save steps are used with Gaussian noise."
     if config["gaussian_noise_variance"] > 0.0 and config["lamd"] > 0.0:
         return False, "Gaussian noise variance cannot be combined with lambda regularization."
+    return True, None
+
+
+def _validate_load_request(request: dict[str, Any]) -> tuple[bool, str | None]:
+    if not request["result_prefix"].strip():
+        return False, "A result prefix or existing HIPPS-DIMES output file path is required."
     return True, None
 
 
@@ -1346,12 +1913,18 @@ def _render_overview(artifacts: RunArtifacts) -> None:
     run_parameters = results["run_parameters"]
     final_loss = iteration_series["loss"].iloc[-1] if not iteration_series.empty else np.nan
     final_entropy = iteration_series["entropy"].iloc[-1] if not iteration_series.empty else np.nan
+    runtime_display = f"{artifacts.runtime_seconds:.2f}s" if np.isfinite(artifacts.runtime_seconds) else "N/A"
+    runtime_note = (
+        "Wall-clock time inside the Streamlit run."
+        if np.isfinite(artifacts.runtime_seconds)
+        else "Unavailable when loading results from disk."
+    )
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         _metric_card("Matrix size", str(connectivity_matrix.shape[0]), "Loci in the final connectivity matrix.")
     with col2:
-        _metric_card("Runtime", f"{artifacts.runtime_seconds:.2f}s", "Wall-clock time inside the Streamlit run.")
+        _metric_card("Runtime", runtime_display, runtime_note)
     with col3:
         _metric_card("Final loss", f"{final_loss:.4g}", "Last point from the iteration series.")
     with col4:
@@ -1367,10 +1940,12 @@ def _render_overview(artifacts: RunArtifacts) -> None:
         lines = [
             f"Input: `{artifacts.config['input_path']}`",
             f"Output prefix: `{artifacts.config['output_prefix'] or 'in-memory only'}`",
-            f"Saved XYZs: `{'xyzs' in results}`",
+            f"Available XYZs: `{'xyzs' in results}`",
             f"Final contact map: `{'cmap_final' in results}`",
             f"Intermediate checkpoints: `{len(results.get('connectivity_matrix_at_steps', {}))}`",
         ]
+        if artifacts.config.get("loaded_from"):
+            lines.append(f"Loaded from: `{artifacts.config['loaded_from']}`")
         st.markdown("\n".join(f"- {line}" for line in lines))
 
         st.download_button(
@@ -1465,11 +2040,36 @@ def _render_convergence(results: dict[str, Any]) -> None:
     st.dataframe(iteration_series.tail(25), use_container_width=True, hide_index=True)
 
 
-def _render_structures(results: dict[str, Any]) -> None:
+def _render_structures(bindings: HippsBindings, artifacts: RunArtifacts) -> None:
+    results = artifacts.results
     xyzs = results.get("xyzs")
     if xyzs is None:
-        st.info("XYZ generation was disabled for this run.")
-        return
+        if "xyz_load_error" in results:
+            st.warning(f"Could not load the XYZ ensemble: {results['xyz_load_error']}")
+        else:
+            st.info("No XYZ ensemble is currently available for this result set.")
+
+        default_ensemble = int(artifacts.config.get("ensemble") or 100)
+        ensemble = st.number_input(
+            "Ensemble size for on-demand generation",
+            min_value=1,
+            value=max(default_ensemble, 1),
+            step=10,
+            key="structure_generate_ensemble",
+            help="Generate structures in the app with HIPPS-DIMES `a2xyz_sample(connectivity_matrix, ensemble=ensemble)`.",
+        )
+        if st.button("Generate structures in app", use_container_width=True, key="generate_xyzs_in_app"):
+            with st.spinner("Generating structures from the connectivity matrix..."):
+                xyzs = bindings.a2xyz_sample(
+                    results["connectivity_matrix"],
+                    ensemble=int(ensemble),
+                )
+            results["xyzs"] = xyzs
+            artifacts.config["ensemble"] = int(ensemble)
+            results.pop("xyz_load_error", None)
+
+        if xyzs is None:
+            return
 
     snapshot_index = st.slider(
         "Structure snapshot",
@@ -1599,7 +2199,7 @@ def _render_results(bindings: HippsBindings, artifacts: RunArtifacts) -> None:
     with tabs[2]:
         _render_convergence(artifacts.results)
     with tabs[3]:
-        _render_structures(artifacts.results)
+        _render_structures(bindings, artifacts)
     with tabs[4]:
         _render_dynamics(bindings, artifacts.results)
     with tabs[5]:
@@ -1631,32 +2231,61 @@ def main() -> None:
     _render_header(gpu_summary)
     st.markdown("")
 
-    config = _render_sidebar(bindings)
-    if config is not None:
-        valid, error_message = _validate_config(config)
-        if not valid:
-            st.session_state.pop("artifacts", None)
-            st.error(error_message)
+    with st.sidebar:
+        st.header("Data Source")
+        data_source_mode = st.radio(
+            "Mode",
+            ["Run HIPPS-DIMES", "Load existing results"],
+            index=0,
+            label_visibility="collapsed",
+        )
+
+    request = (
+        _render_sidebar(bindings)
+        if data_source_mode == "Run HIPPS-DIMES"
+        else _render_load_results_sidebar()
+    )
+    if request is not None:
+        if request["mode"] == "run":
+            valid, error_message = _validate_config(request)
+            if not valid:
+                st.session_state.pop("artifacts", None)
+                st.error(error_message)
+            else:
+                with st.status("Running HIPPS-DIMES...", expanded=True) as run_status:
+                    st.caption("Live HIPPS-DIMES progress")
+                    live_progress_bar_placeholder = st.empty()
+                    live_progress_summary_placeholder = st.empty()
+                    live_entropy_chart_placeholder = st.empty()
+                    try:
+                        st.session_state["artifacts"] = _run_model(
+                            bindings,
+                            request,
+                            live_progress_bar_placeholder=live_progress_bar_placeholder,
+                            live_progress_summary_placeholder=live_progress_summary_placeholder,
+                            live_entropy_chart_placeholder=live_entropy_chart_placeholder,
+                        )
+                    except Exception as exc:
+                        st.session_state.pop("artifacts", None)
+                        run_status.update(label="HIPPS-DIMES run failed", state="error", expanded=True)
+                        st.exception(exc)
+                    else:
+                        run_status.update(label="HIPPS-DIMES run complete", state="complete", expanded=False)
         else:
-            with st.status("Running HIPPS-DIMES...", expanded=True) as run_status:
-                st.caption("Live HIPPS-DIMES progress")
-                live_progress_bar_placeholder = st.empty()
-                live_progress_summary_placeholder = st.empty()
-                live_entropy_chart_placeholder = st.empty()
-                try:
-                    st.session_state["artifacts"] = _run_model(
-                        bindings,
-                        config,
-                        live_progress_bar_placeholder=live_progress_bar_placeholder,
-                        live_progress_summary_placeholder=live_progress_summary_placeholder,
-                        live_entropy_chart_placeholder=live_entropy_chart_placeholder,
-                    )
-                except Exception as exc:
-                    st.session_state.pop("artifacts", None)
-                    run_status.update(label="HIPPS-DIMES run failed", state="error", expanded=True)
-                    st.exception(exc)
-                else:
-                    run_status.update(label="HIPPS-DIMES run complete", state="complete", expanded=False)
+            valid, error_message = _validate_load_request(request)
+            if not valid:
+                st.session_state.pop("artifacts", None)
+                st.error(error_message)
+            else:
+                with st.status("Loading results...", expanded=False) as load_status:
+                    try:
+                        st.session_state["artifacts"] = _load_existing_results(bindings, request)
+                    except Exception as exc:
+                        st.session_state.pop("artifacts", None)
+                        load_status.update(label="Result loading failed", state="error", expanded=True)
+                        st.exception(exc)
+                    else:
+                        load_status.update(label="Results loaded", state="complete", expanded=False)
 
     artifacts = st.session_state.get("artifacts")
     if artifacts is None:
