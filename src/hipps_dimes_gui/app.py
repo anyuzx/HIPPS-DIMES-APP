@@ -58,6 +58,9 @@ class HippsBindings:
     neighbor_balance_symmetric: Callable[..., np.ndarray]
     is_gpu_available: Callable[[], bool]
     get_gpu_name: Callable[[], str | None]
+    summarize_missing_data: Callable[..., dict[str, Any]] | None
+    repair_fully_missing_loci: Callable[..., tuple[np.ndarray, dict[str, Any]]] | None
+    remove_fully_missing_loci: Callable[..., tuple[np.ndarray, dict[str, Any]]] | None
     cooler: Any
     hicstraw: Any
 
@@ -324,6 +327,16 @@ def _load_bindings() -> HippsBindings:
         neighbor_balance_symmetric,
         run_optimization,
     )
+    try:
+        from hipps_dimes.api import (
+            _remove_fully_missing_loci,
+            _repair_fully_missing_loci_nearest_neighbors,
+            _summarize_missing_data,
+        )
+    except ImportError:
+        _remove_fully_missing_loci = None
+        _repair_fully_missing_loci_nearest_neighbors = None
+        _summarize_missing_data = None
     from hipps_dimes.numerics import cooler, hicstraw
 
     return HippsBindings(
@@ -338,6 +351,9 @@ def _load_bindings() -> HippsBindings:
         neighbor_balance_symmetric=neighbor_balance_symmetric,
         is_gpu_available=is_gpu_available,
         get_gpu_name=get_gpu_name,
+        summarize_missing_data=_summarize_missing_data,
+        repair_fully_missing_loci=_repair_fully_missing_loci_nearest_neighbors,
+        remove_fully_missing_loci=_remove_fully_missing_loci,
         cooler=cooler,
         hicstraw=hicstraw,
     )
@@ -845,7 +861,7 @@ def _build_loaded_config(
     config = {
         "mode": "load",
         "input_path": _normalize_input_path(str(input_path)) if input_path else "",
-        "output_prefix": result_prefix,
+        "output_prefix": str(parameter_map.get("output_prefix") or result_prefix),
         "input_type": str(parameter_map.get("input_type") or "dmap"),
         "input_format": str(parameter_map.get("input_format") or "text"),
         "selection": str(parameter_map.get("selection") or ""),
@@ -872,6 +888,8 @@ def _build_loaded_config(
         "no_log": _bool_value(parameter_map.get("no_log"), False),
         "no_xyzs": _bool_value(parameter_map.get("no_xyzs"), False),
         "ignore_missing_data": _bool_value(parameter_map.get("ignore_missing_data"), False),
+        "remove_fully_missing_loci": _bool_value(parameter_map.get("remove_fully_missing_loci"), False),
+        "save_pickle": _bool_value(parameter_map.get("save_pickle"), False),
         "enforce_nonnegative_connectivity_matrix": _bool_value(
             parameter_map.get("enforce_nonnegative_connectivity_matrix"),
             False,
@@ -892,6 +910,7 @@ def _build_loaded_config(
                 "neighbor_balance": bool(overrides.get("neighbor_balance", False)),
                 "not_normalize": bool(overrides.get("not_normalize", False)),
                 "ignore_missing_data": bool(overrides.get("ignore_missing_data", False)),
+                "remove_fully_missing_loci": bool(overrides.get("remove_fully_missing_loci", False)),
                 "binsize": int(overrides.get("binsize", config["binsize"])),
                 "hic_norm": overrides.get("hic_norm", config["hic_norm"]),
                 "hic_unit": overrides.get("hic_unit", config["hic_unit"]),
@@ -910,6 +929,70 @@ def _build_minimal_run_parameters_frame(config: dict[str, Any]) -> pd.DataFrame:
         ("selection", config.get("selection")),
     ]
     return pd.DataFrame(rows, columns=["parameter", "value"])
+
+
+def _normalize_index_list(values: Any) -> list[int]:
+    if values is None:
+        return []
+    if isinstance(values, np.ndarray):
+        values = values.tolist()
+    if not isinstance(values, (list, tuple, set)):
+        return []
+
+    normalized: list[int] = []
+    for value in values:
+        try:
+            normalized.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return normalized
+
+
+def _normalize_pair_list(values: Any) -> list[tuple[int, int]]:
+    if values is None:
+        return []
+    if isinstance(values, np.ndarray):
+        values = values.tolist()
+    if not isinstance(values, (list, tuple, set)):
+        return []
+
+    normalized: list[tuple[int, int]] = []
+    for value in values:
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            continue
+        try:
+            normalized.append((int(value[0]), int(value[1])))
+        except (TypeError, ValueError):
+            continue
+    return normalized
+
+
+def _format_index_preview(values: list[int], limit: int = 8) -> str:
+    if not values:
+        return "None"
+    preview = ", ".join(str(value) for value in values[:limit])
+    if len(values) <= limit:
+        return preview
+    return f"{preview}, ... ({len(values)} total)"
+
+
+def _format_pair_preview(values: list[tuple[int, int]], limit: int = 6) -> str:
+    if not values:
+        return "None"
+    preview = ", ".join(f"{left}-{right}" for left, right in values[:limit])
+    if len(values) <= limit:
+        return preview
+    return f"{preview}, ... ({len(values)} total)"
+
+
+def _build_run_parameter_map(run_parameters: Any) -> dict[str, Any]:
+    try:
+        _, parameter_map = _coerce_run_parameters_artifact(run_parameters)
+    except ValueError:
+        return {}
+    return parameter_map
 
 
 def _coerce_iteration_series_frame(data: Any) -> pd.DataFrame:
@@ -992,6 +1075,10 @@ def _coerce_results_mapping(results: dict[str, Any]) -> dict[str, Any]:
         normalized["connectivity_matrix_at_steps"] = _coerce_checkpoint_artifact(
             normalized["connectivity_matrix_at_steps"]
         )
+    if "kept_loci" in normalized and normalized["kept_loci"] is not None:
+        normalized["kept_loci"] = _normalize_index_list(normalized["kept_loci"])
+    if "removed_fully_missing_loci" in normalized and normalized["removed_fully_missing_loci"] is not None:
+        normalized["removed_fully_missing_loci"] = _normalize_index_list(normalized["removed_fully_missing_loci"])
 
     return normalized
 
@@ -1177,6 +1264,14 @@ def _load_existing_results(bindings: HippsBindings, request: dict[str, Any]) -> 
         "connectivity_matrix": np.asarray(np.loadtxt(connectivity_path), dtype=float),
     }
 
+    removed_fully_missing_loci = _normalize_index_list(parameter_map.get("removed_fully_missing_loci"))
+    if removed_fully_missing_loci:
+        results["removed_fully_missing_loci"] = removed_fully_missing_loci
+        original_rows = _int_value(parameter_map.get("matrix_rows_original"), None)
+        if original_rows is not None and original_rows > 0:
+            removed_lookup = set(removed_fully_missing_loci)
+            results["kept_loci"] = [index for index in range(original_rows) if index not in removed_lookup]
+
     iteration_series_path = Path(f"{result_prefix}_iteration_series.csv")
     if iteration_series_path.exists():
         iteration_series = pd.read_csv(iteration_series_path)
@@ -1301,15 +1396,43 @@ def _build_target_matrices(
 ) -> dict[str, np.ndarray]:
     input_type = config["input_type"]
 
+    def _prepare_missing_data_target(matrix: np.ndarray) -> np.ndarray:
+        matrix = np.asarray(matrix, dtype=float)
+        if not config.get("ignore_missing_data"):
+            return matrix
+        if (
+            bindings.summarize_missing_data is None
+            or bindings.repair_fully_missing_loci is None
+            or bindings.remove_fully_missing_loci is None
+        ):
+            raise RuntimeError(
+                "The installed HIPPS-DIMES build does not expose the missing-data helpers "
+                "required to reconstruct the optimizer target."
+            )
+
+        summary = bindings.summarize_missing_data(matrix, input_type)
+        if config.get("remove_fully_missing_loci") and summary["fully_missing_loci"]:
+            matrix, _ = bindings.remove_fully_missing_loci(matrix, input_type)
+            return np.asarray(matrix, dtype=float)
+        if summary["fully_missing_loci"]:
+            matrix, _ = bindings.repair_fully_missing_loci(
+                matrix,
+                input_type,
+                summary["missing_mask"],
+                summary["fully_missing_loci"],
+            )
+        return np.asarray(matrix, dtype=float)
+
     if input_type == "dmap":
-        return {"dmap_target": np.asarray(input_matrix, dtype=float)}
+        return {"dmap_target": _prepare_missing_data_target(input_matrix)}
 
     if input_type == "ddmap":
-        dmap_target = np.sqrt((8.0 / (3.0 * np.pi)) * np.asarray(input_matrix, dtype=float))
+        ddmap_target = _prepare_missing_data_target(input_matrix)
+        dmap_target = np.sqrt((8.0 / (3.0 * np.pi)) * np.asarray(ddmap_target, dtype=float))
         return {"dmap_target": dmap_target}
 
     if input_type == "cmap":
-        cmap_target = np.asarray(input_matrix, dtype=float)
+        cmap_target = _prepare_missing_data_target(input_matrix)
         if config["neighbor_balance"]:
             cmap_target = bindings.neighbor_balance_symmetric(
                 cmap_target,
@@ -1368,6 +1491,9 @@ def _render_header(gpu_summary: str) -> None:
 def _render_sidebar(bindings: HippsBindings) -> dict[str, Any] | None:
     gpu_available = bindings.is_gpu_available()
     gpu_name = bindings.get_gpu_name() if gpu_available else None
+    run_signature = inspect.signature(bindings.run_optimization)
+    remove_fully_missing_loci_supported = "remove_fully_missing_loci" in run_signature.parameters
+    save_pickle_supported = "save_pickle" in run_signature.parameters
 
     with st.sidebar:
         _initialize_path_state()
@@ -1458,9 +1584,24 @@ def _render_sidebar(bindings: HippsBindings) -> dict[str, Any] | None:
                     value="",
                     help="Comma-separated iterations. When Gaussian noise is enabled, HIPPS-DIMES requires an output prefix.",
                 )
+                save_pickle = st.checkbox(
+                    "Save results pickle only",
+                    value=False,
+                    disabled=not save_pickle_supported,
+                    help=(
+                        "Write only `{output_prefix}_HIPPS_DIMES_results.pkl` and suppress the default "
+                        "text/CSV/XYZ output files."
+                    ),
+                )
                 no_log = st.checkbox("Skip CSV logs", value=False)
                 no_xyzs = st.checkbox("Skip XYZ generation", value=False)
                 ignore_missing_data = st.checkbox("Ignore missing data", value=False)
+                remove_fully_missing_loci = st.checkbox(
+                    "Remove fully missing loci",
+                    value=False,
+                    disabled=not remove_fully_missing_loci_supported,
+                    help="Reduce the optimization problem by dropping loci whose full off-diagonal row/column is missing.",
+                )
                 enforce_nonnegative = st.checkbox("Enforce nonnegative springs", value=False)
 
             run_clicked = st.form_submit_button("Run HIPPS-DIMES", use_container_width=True)
@@ -1495,9 +1636,11 @@ def _render_sidebar(bindings: HippsBindings) -> dict[str, Any] | None:
             "neighbor_balance": bool(neighbor_balance),
             "not_normalize": bool(not_normalize),
             "save_steps": save_steps,
+            "save_pickle": bool(save_pickle),
             "no_log": bool(no_log),
             "no_xyzs": bool(no_xyzs),
             "ignore_missing_data": bool(ignore_missing_data),
+            "remove_fully_missing_loci": bool(remove_fully_missing_loci),
             "enforce_nonnegative_connectivity_matrix": bool(enforce_nonnegative),
         }
         return config
@@ -1518,7 +1661,7 @@ def _render_load_results_sidebar() -> dict[str, Any] | None:
                 value="",
                 help=(
                     "Examples: `/path/to/run`, `/path/to/run_connectivity_matrix.txt`, "
-                    "`/path/to/run_iteration_series.csv`, or `/path/to/run_results.pkl`."
+                    "`/path/to/run_iteration_series.csv`, or `/path/to/run_HIPPS_DIMES_results.pkl`."
                 ),
             )
 
@@ -1547,6 +1690,11 @@ def _render_load_results_sidebar() -> dict[str, Any] | None:
                 override_neighbor_balance = st.checkbox("Neighbor balance", value=False, key="load_neighbor_balance")
                 override_not_normalize = st.checkbox("Skip contact-map normalization", value=False, key="load_not_normalize")
                 override_ignore_missing_data = st.checkbox("Ignore missing data", value=False, key="load_ignore_missing_data")
+                override_remove_fully_missing_loci = st.checkbox(
+                    "Remove fully missing loci",
+                    value=False,
+                    key="load_remove_fully_missing_loci",
+                )
 
             load_clicked = st.form_submit_button("Load existing results", use_container_width=True)
 
@@ -1570,6 +1718,7 @@ def _render_load_results_sidebar() -> dict[str, Any] | None:
                 "neighbor_balance": bool(override_neighbor_balance),
                 "not_normalize": bool(override_not_normalize),
                 "ignore_missing_data": bool(override_ignore_missing_data),
+                "remove_fully_missing_loci": bool(override_remove_fully_missing_loci),
             },
         }
 
@@ -1589,8 +1738,14 @@ def _validate_config(config: dict[str, Any]) -> tuple[bool, str | None]:
         save_steps = _parse_save_steps(config["save_steps"])
     except ValueError:
         return False, "Save steps must be a comma-separated list of integers."
+    if config["save_pickle"] and not config["output_prefix"].strip():
+        return False, "Output prefix is required when saving a results pickle."
     if save_steps is not None and config["gaussian_noise_variance"] > 0.0 and not config["output_prefix"].strip():
         return False, "Output prefix is required when save steps are used with Gaussian noise."
+    if config["remove_fully_missing_loci"] and not config["ignore_missing_data"]:
+        return False, "Remove fully missing loci requires Ignore missing data."
+    if config["gaussian_noise_variance"] > 0.0 and config["method"] == "DI":
+        return False, "Gaussian noise variance is only supported for IS and GD."
     if config["gaussian_noise_variance"] > 0.0 and config["lamd"] > 0.0:
         return False, "Gaussian noise variance cannot be combined with lambda regularization."
     return True, None
@@ -1599,6 +1754,9 @@ def _validate_config(config: dict[str, Any]) -> tuple[bool, str | None]:
 def _validate_load_request(request: dict[str, Any]) -> tuple[bool, str | None]:
     if not request["result_prefix"].strip():
         return False, "A result prefix or existing HIPPS-DIMES output file path is required."
+    overrides = request.get("overrides") or {}
+    if overrides.get("enabled") and overrides.get("remove_fully_missing_loci") and not overrides.get("ignore_missing_data"):
+        return False, "Remove fully missing loci requires Ignore missing data in the override metadata."
     return True, None
 
 
@@ -1660,6 +1818,10 @@ def _run_model(
         entropy_chart_placeholder=live_entropy_chart_placeholder,
     )
     run_signature = inspect.signature(bindings.run_optimization)
+    if "remove_fully_missing_loci" in run_signature.parameters:
+        kwargs["remove_fully_missing_loci"] = config["remove_fully_missing_loci"]
+    if "save_pickle" in run_signature.parameters:
+        kwargs["save_pickle"] = config["save_pickle"]
     native_progress_supported = (
         "progress_callback" in run_signature.parameters
         and "show_progress" in run_signature.parameters
@@ -1906,6 +2068,60 @@ def _plot_dual_axis_series(
     return figure
 
 
+def _build_missing_data_lines(results: dict[str, Any], run_parameters: Any) -> list[str]:
+    parameter_map = _build_run_parameter_map(run_parameters)
+    if not parameter_map:
+        return []
+
+    lines: list[str] = []
+    original_rows = _int_value(parameter_map.get("matrix_rows_original"), None)
+    optimized_rows = _int_value(parameter_map.get("matrix_rows"), None)
+    if (
+        original_rows is not None
+        and optimized_rows is not None
+        and original_rows > 0
+        and optimized_rows > 0
+        and original_rows != optimized_rows
+    ):
+        lines.append(f"Reduced problem size: `{original_rows}` -> `{optimized_rows}` loci")
+
+    missing_pairs = _int_value(parameter_map.get("missing_pairs"), None)
+    missing_fraction = parameter_map.get("missing_pair_fraction")
+    if missing_pairs is not None and missing_pairs > 0:
+        try:
+            fraction_text = f" ({100.0 * float(missing_fraction):.2f}%)"
+        except (TypeError, ValueError):
+            fraction_text = ""
+        lines.append(f"Input missing pairs: `{missing_pairs}`{fraction_text}")
+
+    fully_missing_loci = _normalize_index_list(parameter_map.get("fully_missing_loci"))
+    if fully_missing_loci:
+        lines.append(f"Fully missing loci: `{_format_index_preview(fully_missing_loci)}`")
+
+    removed_fully_missing_loci = _normalize_index_list(
+        results.get("removed_fully_missing_loci", parameter_map.get("removed_fully_missing_loci"))
+    )
+    if removed_fully_missing_loci:
+        lines.append(
+            f"Removed before optimization: `{_format_index_preview(removed_fully_missing_loci)}`"
+        )
+
+    repair_count = _int_value(parameter_map.get("nearest_neighbor_repair_count"), None)
+    repaired_pairs = _normalize_pair_list(parameter_map.get("nearest_neighbor_repaired_pairs"))
+    if repair_count is not None and repair_count > 0:
+        detail = f" ({_format_pair_preview(repaired_pairs)})" if repaired_pairs else ""
+        lines.append(f"Nearest-neighbor repairs: `{repair_count}` pair(s){detail}")
+
+    remaining_fully_missing_loci = _normalize_index_list(parameter_map.get("remaining_fully_missing_loci"))
+    if remaining_fully_missing_loci:
+        lines.append(
+            "Remaining fully missing loci after preprocessing: "
+            f"`{_format_index_preview(remaining_fully_missing_loci)}`"
+        )
+
+    return lines
+
+
 def _render_overview(artifacts: RunArtifacts) -> None:
     results = artifacts.results
     iteration_series = results["iteration_series"]
@@ -1947,6 +2163,11 @@ def _render_overview(artifacts: RunArtifacts) -> None:
         if artifacts.config.get("loaded_from"):
             lines.append(f"Loaded from: `{artifacts.config['loaded_from']}`")
         st.markdown("\n".join(f"- {line}" for line in lines))
+
+        missing_data_lines = _build_missing_data_lines(results, run_parameters)
+        if missing_data_lines:
+            st.subheader("Missing-data handling")
+            st.markdown("\n".join(f"- {line}" for line in missing_data_lines))
 
         st.download_button(
             "Download iteration series CSV",

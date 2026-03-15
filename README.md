@@ -9,9 +9,11 @@ This repository contains the app layer only. The numerical model and optimizatio
 ## Features
 
 - Run `run_optimization()` directly from a Streamlit UI
+- Save or load pickle-only HIPPS-DIMES result bundles
 - Inspect distance maps, contact maps, and connectivity matrices
 - Compare target matrices against HIPPS-DIMES output
 - Review convergence curves and live optimization progress
+- Handle missing-data runs, including nearest-neighbor repair and fully-missing-locus removal
 - Visualize sampled 3D structures
 - Compute dynamics and mechanics observables from the final connectivity matrix
 - Browse local files and inspect available `.cool` / `.mcool` groups before launching a run
@@ -87,8 +89,18 @@ streamlit run app.py
 1. Set `Input file path` to a local file.
 2. Choose the correct `Input type` and `Input format`.
 3. For `cooler` and `.hic` inputs, fill in `Selection / region`.
-4. Adjust optimization parameters in the sidebar.
+4. Adjust optimization parameters in the sidebar, including optional missing-data handling and pickle output.
 5. Click `Run HIPPS-DIMES`.
+
+## Result loading
+
+Use `Load existing results` in the sidebar to open:
+
+- a standard output prefix such as `/path/to/run`
+- one of the saved text or CSV artifacts such as `/path/to/run_connectivity_matrix.txt`
+- a pickle-only output such as `/path/to/run_HIPPS_DIMES_results.pkl`
+
+If the original input file moved or `run_parameters.csv` is unavailable, use the metadata override panel to rebuild target matrices manually.
 
 ## Supported inputs
 
@@ -169,6 +181,8 @@ Bulk and per-locus modulus calculations from the optimized connectivity matrix.
 - GPU options appear automatically when HIPPS-DIMES detects a supported GPU environment.
 - The app keeps the most recent run in memory for interactive inspection.
 - For noisy runs with `save_steps`, HIPPS-DIMES requires an `Output prefix`.
+- `Save results pickle only` writes `{output_prefix}_HIPPS_DIMES_results.pkl` and suppresses the default text/CSV/XYZ output files.
+- `Remove fully missing loci` should be used together with `Ignore missing data`.
 
 ## Troubleshooting
 
@@ -198,3 +212,7 @@ Check:
 - `Input format = hic`
 - `Selection / region` is filled in
 - `Hi-C binsize`, normalization, and unit match the file
+
+### My matrix comparison says shapes do not match
+
+This usually means the original run dropped fully missing loci before optimization. Load the original `run_parameters.csv` or result pickle, or enable the same missing-data override options when reconstructing targets from the source input.
