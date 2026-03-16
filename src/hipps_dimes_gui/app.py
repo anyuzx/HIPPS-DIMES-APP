@@ -43,6 +43,9 @@ SUPPORTED_INPUT_FORMATS = {
     "dmap": ("text", "npy"),
     "ddmap": ("text", "npy"),
 }
+RESULT_VIEW_OPTIONS = ("Overview", "Matrices", "Convergence", "3D Structure", "Dynamics", "Mechanics")
+RESULT_MATRIX_DTYPE = np.float32
+MAX_HEATMAP_DIM = 600
 
 
 @dataclass
@@ -271,7 +274,7 @@ class _StreamlitOutputBuffer(io.TextIOBase):
 
             self._entropy_chart_placeholder.altair_chart(
                 chart,
-                use_container_width=True,
+                width="stretch",
             )
             self._last_chart_step_rendered = self._last_progress_step
             self._last_chart_render = now
@@ -666,10 +669,10 @@ def _render_filesystem_picker() -> None:
 
     st.text_input("Directory", key="browser_dir_entry")
     nav_col1, nav_col2, nav_col3, nav_col4 = st.columns(4)
-    nav_col1.button("Go", use_container_width=True, key="browser_go", on_click=_go_to_browser_directory)
-    nav_col2.button("Up", use_container_width=True, key="browser_up", on_click=_go_up_browser_directory)
-    nav_col3.button("Home", use_container_width=True, key="browser_home", on_click=_go_home_browser_directory)
-    nav_col4.button("Sync", use_container_width=True, key="browser_sync", on_click=_sync_browser_directory_to_input)
+    nav_col1.button("Go", width="stretch", key="browser_go", on_click=_go_to_browser_directory)
+    nav_col2.button("Up", width="stretch", key="browser_up", on_click=_go_up_browser_directory)
+    nav_col3.button("Home", width="stretch", key="browser_home", on_click=_go_home_browser_directory)
+    nav_col4.button("Sync", width="stretch", key="browser_sync", on_click=_sync_browser_directory_to_input)
 
     filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 1.6])
     show_hidden = filter_col1.checkbox("Hidden", value=False, key="browser_show_hidden")
@@ -692,7 +695,7 @@ def _render_filesystem_picker() -> None:
         )
         st.button(
             "Open folder",
-            use_container_width=True,
+            width="stretch",
             key="browser_open_dir",
             on_click=_open_selected_browser_directory,
             args=[selected_dir],
@@ -706,7 +709,7 @@ def _render_filesystem_picker() -> None:
         )
         st.button(
             "Use file",
-            use_container_width=True,
+            width="stretch",
             key="browser_use_file",
             on_click=_use_selected_browser_file,
             args=[selected_file],
@@ -770,6 +773,14 @@ def _normalize_existing_result_prefix(raw_value: str) -> str:
         return normalized[: checkpoint_match.start()]
 
     return normalized
+
+
+def _as_result_array(data: Any) -> np.ndarray:
+    return np.asarray(data, dtype=RESULT_MATRIX_DTYPE)
+
+
+def _load_text_matrix(path: str | Path) -> np.ndarray:
+    return np.loadtxt(Path(path).expanduser(), dtype=RESULT_MATRIX_DTYPE)
 
 
 def _is_pickle_result_path(raw_value: str) -> bool:
@@ -1046,7 +1057,7 @@ def _coerce_checkpoint_artifact(data: Any) -> dict[int, np.ndarray]:
 
     checkpoints: dict[int, np.ndarray] = {}
     for step, matrix in data.items():
-        checkpoints[int(step)] = np.asarray(matrix, dtype=float)
+        checkpoints[int(step)] = _as_result_array(matrix)
     return dict(sorted(checkpoints.items()))
 
 
@@ -1060,17 +1071,17 @@ def _coerce_results_mapping(results: dict[str, Any]) -> dict[str, Any]:
     )
     normalized["iteration_series"] = iteration_series
     normalized["log"] = iteration_series
-    normalized["connectivity_matrix"] = np.asarray(normalized["connectivity_matrix"], dtype=float)
-    normalized["dmap_final"] = np.asarray(normalized["dmap_final"], dtype=float)
+    normalized["connectivity_matrix"] = _as_result_array(normalized["connectivity_matrix"])
+    normalized["dmap_final"] = _as_result_array(normalized["dmap_final"])
 
     if "cmap_final" in normalized and normalized["cmap_final"] is not None:
-        normalized["cmap_final"] = np.asarray(normalized["cmap_final"], dtype=float)
+        normalized["cmap_final"] = _as_result_array(normalized["cmap_final"])
     if "dmap_target" in normalized and normalized["dmap_target"] is not None:
-        normalized["dmap_target"] = np.asarray(normalized["dmap_target"], dtype=float)
+        normalized["dmap_target"] = _as_result_array(normalized["dmap_target"])
     if "cmap_target" in normalized and normalized["cmap_target"] is not None:
-        normalized["cmap_target"] = np.asarray(normalized["cmap_target"], dtype=float)
+        normalized["cmap_target"] = _as_result_array(normalized["cmap_target"])
     if "xyzs" in normalized and normalized["xyzs"] is not None:
-        normalized["xyzs"] = np.asarray(normalized["xyzs"], dtype=float)
+        normalized["xyzs"] = _as_result_array(normalized["xyzs"])
     if "connectivity_matrix_at_steps" in normalized:
         normalized["connectivity_matrix_at_steps"] = _coerce_checkpoint_artifact(
             normalized["connectivity_matrix_at_steps"]
@@ -1085,46 +1096,51 @@ def _coerce_results_mapping(results: dict[str, Any]) -> dict[str, Any]:
 
 def _load_xyz_ensemble(xyz_path: Path) -> np.ndarray:
     snapshots: list[np.ndarray] = []
-    lines = xyz_path.read_text().splitlines()
-    cursor = 0
+    with xyz_path.open() as handle:
+        while True:
+            header = ""
+            for raw_line in handle:
+                header = raw_line.strip()
+                if header:
+                    break
+            if not header:
+                break
 
-    while cursor < len(lines):
-        line = lines[cursor].strip()
-        if not line:
-            cursor += 1
-            continue
-
-        natoms = int(line)
-        cursor += 1
-        if cursor < len(lines) and not lines[cursor].strip():
-            cursor += 1
-
-        coords = []
-        for _ in range(natoms):
-            if cursor >= len(lines):
+            natoms = int(header)
+            comment = next(handle, None)
+            if comment is None:
                 raise ValueError(f"Unexpected end of XYZ file in {xyz_path}.")
-            parts = lines[cursor].split()
-            if len(parts) < 4:
-                raise ValueError(f"Malformed XYZ line in {xyz_path}: {lines[cursor]!r}")
-            coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
-            cursor += 1
 
-        snapshots.append(np.asarray(coords, dtype=float))
+            coords = np.empty((natoms, 3), dtype=RESULT_MATRIX_DTYPE)
+            for atom_index in range(natoms):
+                line = next(handle, None)
+                if line is None:
+                    raise ValueError(f"Unexpected end of XYZ file in {xyz_path}.")
+                parts = line.split()
+                if len(parts) < 4:
+                    raise ValueError(f"Malformed XYZ line in {xyz_path}: {line!r}")
+                coords[atom_index] = (
+                    float(parts[1]),
+                    float(parts[2]),
+                    float(parts[3]),
+                )
+
+            snapshots.append(coords)
 
     if not snapshots:
         raise ValueError(f"No XYZ snapshots found in {xyz_path}.")
-    return np.asarray(snapshots, dtype=float)
+    return np.asarray(snapshots, dtype=RESULT_MATRIX_DTYPE)
 
 
-def _load_connectivity_checkpoints(result_prefix: str) -> dict[int, np.ndarray]:
+def _list_connectivity_checkpoint_paths(result_prefix: str) -> dict[int, str]:
     prefix_path = Path(result_prefix)
     pattern = f"{prefix_path.name}_connectivity_matrix_iter*.txt"
-    checkpoints: dict[int, np.ndarray] = {}
+    checkpoints: dict[int, str] = {}
     for checkpoint_path in prefix_path.parent.glob(pattern):
         match = re.search(r"_connectivity_matrix_iter(\d+)\.txt$", checkpoint_path.name)
         if not match:
             continue
-        checkpoints[int(match.group(1))] = np.asarray(np.loadtxt(checkpoint_path), dtype=float)
+        checkpoints[int(match.group(1))] = str(checkpoint_path)
     return dict(sorted(checkpoints.items()))
 
 
@@ -1135,9 +1151,9 @@ def _build_loaded_target_matrices(
 ) -> dict[str, np.ndarray | str]:
     cmap_target_path = Path(f"{result_prefix}_cmap_target.txt")
     if cmap_target_path.exists():
-        raw_cmap_target = np.asarray(np.loadtxt(cmap_target_path), dtype=float)
+        raw_cmap_target = _load_text_matrix(cmap_target_path)
         updates: dict[str, np.ndarray | str] = {
-            "cmap_target": _normalize_contact_map(raw_cmap_target),
+            "cmap_target": _as_result_array(_normalize_contact_map(raw_cmap_target)),
         }
         if config.get("input_type") == "cmap":
             if config.get("ignore_missing_data"):
@@ -1152,14 +1168,18 @@ def _build_loaded_target_matrices(
                     config["alpha"],
                     config["not_normalize"],
                 )
-            updates["dmap_target"] = np.asarray(dmap_target, dtype=float)
+            updates["dmap_target"] = _as_result_array(dmap_target)
         return updates
 
     if not config.get("input_path"):
         return {}
 
     input_matrix = _load_input_matrix(bindings, config)
-    return _build_target_matrices(bindings, config, input_matrix)
+    updates = _build_target_matrices(bindings, config, input_matrix)
+    return {
+        key: _as_result_array(value) if isinstance(value, np.ndarray) else value
+        for key, value in updates.items()
+    }
 
 
 def _load_pickled_results(
@@ -1213,12 +1233,14 @@ def _load_pickled_results(
     else:
         results["run_parameters"] = run_parameters_frame
 
-    if "matrix_target_error" not in results and "dmap_target" not in results and "cmap_target" not in results:
-        try:
-            target_prefix = str(config.get("output_prefix") or pickle_prefix)
-            results.update(_build_loaded_target_matrices(bindings, target_prefix, config))
-        except Exception as exc:
-            results["matrix_target_error"] = str(exc)
+    if "xyzs" not in results:
+        xyz_path = Path(f"{config['output_prefix']}.xyz")
+        if xyz_path.exists():
+            results["xyz_path"] = str(xyz_path)
+    if "connectivity_matrix_at_steps" not in results:
+        checkpoint_paths = _list_connectivity_checkpoint_paths(config["output_prefix"])
+        if checkpoint_paths:
+            results["connectivity_matrix_checkpoint_paths"] = checkpoint_paths
 
     return RunArtifacts(
         results=results,
@@ -1260,8 +1282,8 @@ def _load_existing_results(bindings: HippsBindings, request: dict[str, Any]) -> 
         "iteration_series": _empty_iteration_series_frame(),
         "log": _empty_iteration_series_frame(),
         "run_parameters": run_parameters if run_parameters is not None else _build_minimal_run_parameters_frame(config),
-        "dmap_final": np.asarray(np.loadtxt(dmap_path), dtype=float),
-        "connectivity_matrix": np.asarray(np.loadtxt(connectivity_path), dtype=float),
+        "dmap_final": _load_text_matrix(dmap_path),
+        "connectivity_matrix": _load_text_matrix(connectivity_path),
     }
 
     removed_fully_missing_loci = _normalize_index_list(parameter_map.get("removed_fully_missing_loci"))
@@ -1280,23 +1302,15 @@ def _load_existing_results(bindings: HippsBindings, request: dict[str, Any]) -> 
 
     cmap_final_path = Path(f"{result_prefix}_cmap_final.txt")
     if cmap_final_path.exists():
-        results["cmap_final"] = np.asarray(np.loadtxt(cmap_final_path), dtype=float)
+        results["cmap_final"] = _load_text_matrix(cmap_final_path)
 
-    checkpoints = _load_connectivity_checkpoints(result_prefix)
-    if checkpoints:
-        results["connectivity_matrix_at_steps"] = checkpoints
+    checkpoint_paths = _list_connectivity_checkpoint_paths(result_prefix)
+    if checkpoint_paths:
+        results["connectivity_matrix_checkpoint_paths"] = checkpoint_paths
 
     xyz_path = Path(f"{result_prefix}.xyz")
     if xyz_path.exists():
-        try:
-            results["xyzs"] = _load_xyz_ensemble(xyz_path)
-        except Exception as exc:
-            results["xyz_load_error"] = str(exc)
-
-    try:
-        results.update(_build_loaded_target_matrices(bindings, result_prefix, config))
-    except Exception as exc:
-        results["matrix_target_error"] = str(exc)
+        results["xyz_path"] = str(xyz_path)
 
     return RunArtifacts(
         results=results,
@@ -1604,7 +1618,7 @@ def _render_sidebar(bindings: HippsBindings) -> dict[str, Any] | None:
                 )
                 enforce_nonnegative = st.checkbox("Enforce nonnegative springs", value=False)
 
-            run_clicked = st.form_submit_button("Run HIPPS-DIMES", use_container_width=True)
+            run_clicked = st.form_submit_button("Run HIPPS-DIMES", width="stretch")
 
         if not run_clicked:
             return None
@@ -1696,7 +1710,7 @@ def _render_load_results_sidebar() -> dict[str, Any] | None:
                     key="load_remove_fully_missing_loci",
                 )
 
-            load_clicked = st.form_submit_button("Load existing results", use_container_width=True)
+            load_clicked = st.form_submit_button("Load existing results", width="stretch")
 
         if not load_clicked:
             return None
@@ -1871,17 +1885,31 @@ def _plot_matrix(
     midpoint: float | None = None,
     log_transform: bool = False,
     corner_labels: tuple[tuple[str, str], ...] = (),
-) -> go.Figure:
+) -> tuple[go.Figure, str | None]:
     plot_matrix = np.asarray(matrix)
+    original_rows, original_cols = plot_matrix.shape
+    row_indices = np.arange(original_rows, dtype=int)
+    col_indices = np.arange(original_cols, dtype=int)
+    display_note: str | None = None
+
+    if original_rows > MAX_HEATMAP_DIM:
+        row_indices = np.unique(np.linspace(0, original_rows - 1, num=MAX_HEATMAP_DIM, dtype=int))
+    if original_cols > MAX_HEATMAP_DIM:
+        col_indices = np.unique(np.linspace(0, original_cols - 1, num=MAX_HEATMAP_DIM, dtype=int))
+    if row_indices.size != original_rows or col_indices.size != original_cols:
+        plot_matrix = plot_matrix[np.ix_(row_indices, col_indices)]
+        display_note = (
+            "Showing an evenly sampled preview "
+            f"({plot_matrix.shape[0]}x{plot_matrix.shape[1]}) of the full "
+            f"{original_rows}x{original_cols} matrix."
+        )
+
     colorbar_title = "value"
     if log_transform:
         plot_matrix = np.where(plot_matrix > 0, np.log(plot_matrix), np.nan)
         colorbar_title = "log(value)"
-    n_rows, n_cols = plot_matrix.shape
-    row_index, col_index = np.indices((n_rows, n_cols))
-    customdata = np.dstack((row_index, col_index))
-    x_coords = np.arange(n_cols, dtype=float) + 0.5
-    y_coords = np.arange(n_rows, dtype=float) + 0.5
+    x_coords = col_indices
+    y_coords = row_indices
 
     figure = go.Figure(
         data=[
@@ -1889,11 +1917,10 @@ def _plot_matrix(
                 x=x_coords,
                 y=y_coords,
                 z=plot_matrix,
-                customdata=customdata,
                 colorscale=colorscale,
                 zmid=midpoint,
                 colorbar=dict(title=colorbar_title),
-                hovertemplate="row=%{customdata[0]}<br>col=%{customdata[1]}<br>value=%{z:.4g}<extra></extra>",
+                hovertemplate="row=%{y}<br>col=%{x}<br>value=%{z:.4g}<extra></extra>",
             )
         ]
     )
@@ -1925,9 +1952,16 @@ def _plot_matrix(
             borderwidth=1,
             borderpad=4,
         )
-    figure.update_xaxes(range=[0, n_cols], constrain="domain")
-    figure.update_yaxes(range=[n_rows, 0], scaleanchor="x", scaleratio=1)
-    return figure
+    figure.update_xaxes(
+        range=[float(x_coords[0]) - 0.5, float(x_coords[-1]) + 0.5],
+        constrain="domain",
+    )
+    figure.update_yaxes(
+        range=[float(y_coords[-1]) + 0.5, float(y_coords[0]) - 0.5],
+        scaleanchor="x",
+        scaleratio=1,
+    )
+    return figure, display_note
 
 
 def _plot_convergence(iteration_series: pd.DataFrame) -> go.Figure:
@@ -2127,6 +2161,10 @@ def _render_overview(artifacts: RunArtifacts) -> None:
     iteration_series = results["iteration_series"]
     connectivity_matrix = results["connectivity_matrix"]
     run_parameters = results["run_parameters"]
+    checkpoint_count = len(results.get("connectivity_matrix_at_steps", {}))
+    if checkpoint_count == 0:
+        checkpoint_count = len(results.get("connectivity_matrix_checkpoint_paths", {}))
+    xyz_available = results.get("xyzs") is not None or bool(results.get("xyz_path"))
     final_loss = iteration_series["loss"].iloc[-1] if not iteration_series.empty else np.nan
     final_entropy = iteration_series["entropy"].iloc[-1] if not iteration_series.empty else np.nan
     runtime_display = f"{artifacts.runtime_seconds:.2f}s" if np.isfinite(artifacts.runtime_seconds) else "N/A"
@@ -2150,15 +2188,15 @@ def _render_overview(artifacts: RunArtifacts) -> None:
     left, right = st.columns([1.25, 1.0])
     with left:
         st.subheader("Run parameters")
-        st.dataframe(run_parameters, use_container_width=True, hide_index=True)
+        st.dataframe(run_parameters, width="stretch", hide_index=True)
     with right:
         st.subheader("Artifacts")
         lines = [
             f"Input: `{artifacts.config['input_path']}`",
             f"Output prefix: `{artifacts.config['output_prefix'] or 'in-memory only'}`",
-            f"Available XYZs: `{'xyzs' in results}`",
+            f"Available XYZs: `{xyz_available}`",
             f"Final contact map: `{'cmap_final' in results}`",
-            f"Intermediate checkpoints: `{len(results.get('connectivity_matrix_at_steps', {}))}`",
+            f"Intermediate checkpoints: `{checkpoint_count}`",
         ]
         if artifacts.config.get("loaded_from"):
             lines.append(f"Loaded from: `{artifacts.config['loaded_from']}`")
@@ -2174,7 +2212,7 @@ def _render_overview(artifacts: RunArtifacts) -> None:
             data=results["iteration_series"].to_csv(index=False),
             file_name="iteration_series.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
         matrix_buffer = io.StringIO()
@@ -2184,11 +2222,36 @@ def _render_overview(artifacts: RunArtifacts) -> None:
             data=matrix_buffer.getvalue(),
             file_name="connectivity_matrix.txt",
             mime="text/plain",
-            use_container_width=True,
+            width="stretch",
         )
 
 
-def _render_matrices(results: dict[str, Any]) -> None:
+def _ensure_target_matrices(bindings: HippsBindings, artifacts: RunArtifacts) -> None:
+    results = artifacts.results
+    if artifacts.config.get("mode") != "load":
+        return
+    if (
+        "matrix_target_error" in results
+        or "dmap_target" in results
+        or "cmap_target" in results
+    ):
+        return
+
+    target_prefix = str(artifacts.config.get("output_prefix") or "")
+    if not target_prefix and artifacts.config.get("loaded_from"):
+        target_prefix = str(Path(artifacts.config["loaded_from"]).with_suffix(""))
+    if not target_prefix:
+        return
+
+    try:
+        results.update(_build_loaded_target_matrices(bindings, target_prefix, artifacts.config))
+    except Exception as exc:
+        results["matrix_target_error"] = str(exc)
+
+
+def _render_matrices(bindings: HippsBindings, artifacts: RunArtifacts) -> None:
+    _ensure_target_matrices(bindings, artifacts)
+    results = artifacts.results
     if "matrix_target_error" in results:
         st.warning(f"Target matrix reconstruction failed: {results['matrix_target_error']}")
 
@@ -2225,31 +2288,55 @@ def _render_matrices(results: dict[str, Any]) -> None:
             ("Target", "lower left"),
             ("HIPPS-DIMES", "upper right"),
         )
+    matrix_figure, matrix_note = _plot_matrix(
+        matrix,
+        title,
+        colorscale,
+        midpoint,
+        log_transform=log_transform,
+        corner_labels=corner_labels,
+    )
     st.plotly_chart(
-        _plot_matrix(matrix, title, colorscale, midpoint, log_transform=log_transform, corner_labels=corner_labels),
-        use_container_width=True,
+        matrix_figure,
+        width="stretch",
         config={"scrollZoom": True},
     )
+    if matrix_note:
+        st.caption(matrix_note)
 
     if selected == "Final distance map" and "dmap_target" in results:
         st.caption("Lower triangle: target dmap. Upper triangle: HIPPS-DIMES result.")
     if selected == "Final contact map" and "cmap_target" in results:
         st.caption("Lower triangle: target cmap. Upper triangle: HIPPS-DIMES result.")
 
-    if "connectivity_matrix_at_steps" in results:
-        checkpoints = results["connectivity_matrix_at_steps"]
-        if checkpoints:
-            st.subheader("Intermediate connectivity checkpoints")
-            selected_step = st.selectbox(
-                "Checkpoint iteration",
-                sorted(checkpoints.keys()),
-                format_func=lambda value: f"Iteration {value}",
-            )
-            st.plotly_chart(
-                _plot_matrix(checkpoints[selected_step], f"Connectivity at iteration {selected_step}", "Tealrose", 0.0),
-                use_container_width=True,
-                config={"scrollZoom": True},
-            )
+    checkpoints = results.get("connectivity_matrix_at_steps", {})
+    checkpoint_paths = results.get("connectivity_matrix_checkpoint_paths", {})
+    if checkpoints or checkpoint_paths:
+        st.subheader("Intermediate connectivity checkpoints")
+        available_steps = sorted(checkpoints.keys() or checkpoint_paths.keys())
+        selected_step = st.selectbox(
+            "Checkpoint iteration",
+            available_steps,
+            format_func=lambda value: f"Iteration {value}",
+        )
+        checkpoint_matrix = (
+            checkpoints[selected_step]
+            if selected_step in checkpoints
+            else _load_text_matrix(checkpoint_paths[selected_step])
+        )
+        checkpoint_figure, checkpoint_note = _plot_matrix(
+            checkpoint_matrix,
+            f"Connectivity at iteration {selected_step}",
+            "Tealrose",
+            0.0,
+        )
+        st.plotly_chart(
+            checkpoint_figure,
+            width="stretch",
+            config={"scrollZoom": True},
+        )
+        if checkpoint_note:
+            st.caption(checkpoint_note)
 
 
 def _render_convergence(results: dict[str, Any]) -> None:
@@ -2257,17 +2344,26 @@ def _render_convergence(results: dict[str, Any]) -> None:
     if iteration_series.empty:
         st.info("No iteration-series data returned.")
         return
-    st.plotly_chart(_plot_convergence(iteration_series), use_container_width=True)
-    st.dataframe(iteration_series.tail(25), use_container_width=True, hide_index=True)
+    st.plotly_chart(_plot_convergence(iteration_series), width="stretch")
+    st.dataframe(iteration_series.tail(25), width="stretch", hide_index=True)
 
 
 def _render_structures(bindings: HippsBindings, artifacts: RunArtifacts) -> None:
     results = artifacts.results
     xyzs = results.get("xyzs")
     if xyzs is None:
+        xyz_path = results.get("xyz_path")
+        if xyz_path:
+            st.info(f"XYZ ensemble available on disk: `{xyz_path}`")
+            if st.button("Load XYZ ensemble from disk", width="stretch", key="load_xyz_from_disk"):
+                with st.spinner("Loading XYZ ensemble from disk..."):
+                    xyzs = _load_xyz_ensemble(Path(xyz_path))
+                results["xyzs"] = xyzs
+                results.pop("xyz_load_error", None)
+
         if "xyz_load_error" in results:
             st.warning(f"Could not load the XYZ ensemble: {results['xyz_load_error']}")
-        else:
+        elif xyzs is None:
             st.info("No XYZ ensemble is currently available for this result set.")
 
         default_ensemble = int(artifacts.config.get("ensemble") or 100)
@@ -2279,13 +2375,14 @@ def _render_structures(bindings: HippsBindings, artifacts: RunArtifacts) -> None
             key="structure_generate_ensemble",
             help="Generate structures in the app with HIPPS-DIMES `a2xyz_sample(connectivity_matrix, ensemble=ensemble)`.",
         )
-        if st.button("Generate structures in app", use_container_width=True, key="generate_xyzs_in_app"):
+        if st.button("Generate structures in app", width="stretch", key="generate_xyzs_in_app"):
             with st.spinner("Generating structures from the connectivity matrix..."):
                 xyzs = bindings.a2xyz_sample(
                     results["connectivity_matrix"],
                     ensemble=int(ensemble),
                 )
-            results["xyzs"] = xyzs
+            results["xyzs"] = _as_result_array(xyzs)
+            xyzs = results["xyzs"]
             artifacts.config["ensemble"] = int(ensemble)
             results.pop("xyz_load_error", None)
 
@@ -2298,7 +2395,7 @@ def _render_structures(bindings: HippsBindings, artifacts: RunArtifacts) -> None
         max_value=int(xyzs.shape[0] - 1),
         value=0,
     )
-    st.plotly_chart(_plot_structure(xyzs[snapshot_index]), use_container_width=True)
+    st.plotly_chart(_plot_structure(xyzs[snapshot_index]), width="stretch")
 
     radius_of_gyration = np.sqrt(np.mean(np.sum((xyzs[snapshot_index] - xyzs[snapshot_index].mean(axis=0)) ** 2, axis=1)))
     st.caption(f"Snapshot {snapshot_index} radius of gyration: {radius_of_gyration:.4f}")
@@ -2326,8 +2423,8 @@ def _render_dynamics(bindings: HippsBindings, results: dict[str, Any]) -> None:
         figure = _plot_two_series(msd[:, 0], msd[:, 1], f"MSD locus {locus}")
         figure.update_xaxes(title_text="Time")
         figure.update_yaxes(title_text="MSD")
-        st.plotly_chart(figure, use_container_width=True)
-        st.dataframe(pd.DataFrame(msd, columns=["time", "msd"]), use_container_width=True, hide_index=True)
+        st.plotly_chart(figure, width="stretch")
+        st.dataframe(pd.DataFrame(msd, columns=["time", "msd"]), width="stretch", hide_index=True)
     else:
         i_col, j_col = st.columns(2)
         i = i_col.slider("Locus i", min_value=0, max_value=int(n_loci - 1), value=0)
@@ -2358,7 +2455,7 @@ def _render_dynamics(bindings: HippsBindings, results: dict[str, Any]) -> None:
         figure.update_xaxes(title_text="Time")
         figure.update_yaxes(title_text="ACF", secondary_y=False)
         figure.update_yaxes(title_text="2-point MSD", secondary_y=True)
-        st.plotly_chart(figure, use_container_width=True)
+        st.plotly_chart(figure, width="stretch")
         merged = pd.DataFrame(
             {
                 "time": acf[:, 0],
@@ -2366,7 +2463,7 @@ def _render_dynamics(bindings: HippsBindings, results: dict[str, Any]) -> None:
                 "two_point_msd": two_point_msd[:, 1],
             }
         )
-        st.dataframe(merged, use_container_width=True, hide_index=True)
+        st.dataframe(merged, width="stretch", hide_index=True)
 
 
 def _render_mechanics(bindings: HippsBindings, results: dict[str, Any]) -> None:
@@ -2395,7 +2492,7 @@ def _render_mechanics(bindings: HippsBindings, results: dict[str, Any]) -> None:
     )
     bulk_figure.update_xaxes(title_text="Angular frequency")
     bulk_figure.update_yaxes(title_text="Modulus")
-    st.plotly_chart(bulk_figure, use_container_width=True)
+    st.plotly_chart(bulk_figure, width="stretch")
 
     st.subheader(f"Per-locus modulus: locus {locus}")
     locus_figure = _plot_two_series(
@@ -2408,22 +2505,30 @@ def _render_mechanics(bindings: HippsBindings, results: dict[str, Any]) -> None:
     )
     locus_figure.update_xaxes(title_text="Angular frequency")
     locus_figure.update_yaxes(title_text="Modulus")
-    st.plotly_chart(locus_figure, use_container_width=True)
+    st.plotly_chart(locus_figure, width="stretch")
 
 
 def _render_results(bindings: HippsBindings, artifacts: RunArtifacts) -> None:
-    tabs = st.tabs(["Overview", "Matrices", "Convergence", "3D Structure", "Dynamics", "Mechanics"])
-    with tabs[0]:
+    selected_view = st.radio(
+        "Results view",
+        RESULT_VIEW_OPTIONS,
+        horizontal=True,
+        label_visibility="collapsed",
+        width="stretch",
+        key="results_view",
+    )
+
+    if selected_view == "Overview":
         _render_overview(artifacts)
-    with tabs[1]:
-        _render_matrices(artifacts.results)
-    with tabs[2]:
+    elif selected_view == "Matrices":
+        _render_matrices(bindings, artifacts)
+    elif selected_view == "Convergence":
         _render_convergence(artifacts.results)
-    with tabs[3]:
+    elif selected_view == "3D Structure":
         _render_structures(bindings, artifacts)
-    with tabs[4]:
+    elif selected_view == "Dynamics":
         _render_dynamics(bindings, artifacts.results)
-    with tabs[5]:
+    else:
         _render_mechanics(bindings, artifacts.results)
 
 
