@@ -2063,6 +2063,23 @@ def _plot_two_series(
     return figure
 
 
+def _compute_local_log_derivative(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    derivative = np.full(y.shape, np.nan, dtype=float)
+    valid = np.isfinite(x) & np.isfinite(y) & (x > 0.0) & (y > 0.0)
+    valid_count = int(np.count_nonzero(valid))
+    if valid_count < 2:
+        return derivative
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_x = np.log(x[valid])
+        log_y = np.log(y[valid])
+    edge_order = 2 if valid_count >= 3 else 1
+    derivative[valid] = np.gradient(log_y, log_x, edge_order=edge_order)
+    return derivative
+
+
 def _plot_dual_axis_series(
     x1: np.ndarray,
     y1: np.ndarray,
@@ -2420,11 +2437,34 @@ def _render_dynamics(bindings: HippsBindings, results: dict[str, Any]) -> None:
     if analysis == "Single-locus MSD":
         locus = st.slider("Locus", min_value=0, max_value=int(n_loci - 1), value=0)
         msd = bindings.compute_m1_i(locus, times, connectivity_matrix, zeta=zeta)
-        figure = _plot_two_series(msd[:, 0], msd[:, 1], f"MSD locus {locus}")
+        msd_log_derivative = _compute_local_log_derivative(msd[:, 0], msd[:, 1])
+        figure = _plot_dual_axis_series(
+            msd[:, 0],
+            msd[:, 1],
+            f"MSD locus {locus}",
+            msd[:, 0],
+            msd_log_derivative,
+            "dlog(MSD)/dlog(t)",
+            log_x=True,
+            log_y1=True,
+            log_y2=False,
+        )
         figure.update_xaxes(title_text="Time")
-        figure.update_yaxes(title_text="MSD")
+        figure.update_yaxes(title_text="MSD", secondary_y=False)
+        figure.update_yaxes(title_text="dlog(MSD)/dlog(t)", secondary_y=True)
         st.plotly_chart(figure, width="stretch")
-        st.dataframe(pd.DataFrame(msd, columns=["time", "msd"]), width="stretch", hide_index=True)
+        st.caption("Secondary axis: local log-log slope dlog(MSD)/dlog(t).")
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "time": msd[:, 0],
+                    "msd": msd[:, 1],
+                    "dlog_msd_dlog_t": msd_log_derivative,
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+        )
     else:
         i_col, j_col = st.columns(2)
         i = i_col.slider("Locus i", min_value=0, max_value=int(n_loci - 1), value=0)
